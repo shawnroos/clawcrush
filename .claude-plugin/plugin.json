@@ -1,0 +1,9 @@
+{
+  "name": "clawcrush",
+  "version": "0.1.0",
+  "description": "Find and destroy zombie processes and repo slop spawned by Claude",
+  "author": {
+    "name": "Shawn Roos"
+  },
+  "keywords": ["cleanup", "zombie", "processes", "slop", "hygiene"]
+}
