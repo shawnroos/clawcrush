@@ -55,8 +55,34 @@ MCP_PATTERNS=(
   "context7"
 )
 
+# The Angular test/dev stack — the highest-frequency real toil (~100+ manual kills across
+# dozens of worktrees). These are HARD-GATED on the classifier above: this is precisely the
+# process class that is legitimately old-and-alive, so under the old age-alone predicate adding
+# them would have meant killing the dev server you are actively using.
+DEV_PATTERNS=(
+  "karma"
+  "ChromeHeadless"
+  "Google Chrome for Testing"
+  "ng serve"
+  "ng test"
+  "vite"
+  "webpack"
+  "esbuild"
+)
+
 # Generic runtimes: only ever candidates when ALREADY orphaned (ppid=1) AND old.
 ORPHAN_RUNTIME_PATTERNS=("node" "bun" "chromium" "chrome")
+
+# TERM-resistant browsers: karma/Chrome empirically survive SIGTERM and always needed -9, so
+# waiting the full 5s on them just delays the SIGKILL that was always coming.
+BROWSER_CLASS_PATTERNS=("ChromeHeadless" "Google Chrome for Testing" "Chromium" "chromium" "Chrome" "chrome")
+BROWSER_GRACE_SECONDS=2
+DEFAULT_GRACE_SECONDS=5
+
+# Dev-server ports worth reclaiming: the Angular range, plus Chrome's CDP port.
+PORT_RANGE_LO=4200
+PORT_RANGE_HI=4299
+PORT_EXTRA=9222
 
 # Which ancestor command shapes count as a LIVE Claude session. This is the one fuzzy seam in
 # the model — the crisp decision (the kill matrix) is fully deterministic downstream.
@@ -413,6 +439,7 @@ zombie_rows() {
   # should not ship as real detection rules.
   local patterns=()
   for p in "${MCP_PATTERNS[@]}"; do patterns+=("$p"); done
+  for p in "${DEV_PATTERNS[@]}"; do patterns+=("$p"); done
   if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
     local oldifs="$IFS"
     IFS=':'
@@ -497,6 +524,51 @@ scan_zombies() {
 
     json_items+=("{\"pid\":$pid,\"name\":\"$(json_escape "$name")\",\"pattern\":\"$(json_escape "$pattern")\",\"age\":\"$age_fmt\",\"age_mins\":$age_mins,\"ppid\":$ppid,\"orphan\":$orphan,\"owner_worktree\":$owner_json,\"owning_session\":$session_json,\"classification\":\"$classification\",\"reason\":\"$(json_escape "$reason")\"}")
   done < <(zombie_rows "$scan_root")
+
+  json_array ${json_items[@]+"${json_items[@]}"}
+}
+
+# ── Scan: Port squatters ───────────────────────
+
+# Pattern+ppid matching misses port-squatters: a dead-parent listener still holding 4200 blocks
+# the next `ng serve`, and the manual fix was always `lsof -ti:PORT | kill -9`. Listeners run
+# through the SAME classifier — an attached listener in another worktree is reported (it
+# explains "port already in use") but is never killable.
+port_in_range() {
+  local port="$1"
+  if (( port >= PORT_RANGE_LO && port <= PORT_RANGE_HI )); then return 0; fi
+  if (( port == PORT_EXTRA )); then return 0; fi
+  return 1
+}
+
+scan_ports() {
+  local scan_root="${1:-}"
+  local json_items=()
+  local seen=" "
+  local pid addr port
+
+  while read -r pid addr; do
+    [[ -z "${pid:-}" || -z "${addr:-}" ]] && continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == "$$" ]] && continue
+    port="${addr##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    port_in_range "$port" || continue
+    [[ "$seen" == *" $pid:$port "* ]] && continue
+    seen="$seen$pid:$port "
+
+    local cmd win cls classification orphan owner session reason
+    cmd=$(pid_command "$pid" 2>/dev/null) || continue
+    win=$(command_window "$cmd")
+    cls=$(classify_pid "$pid" "$scan_root")
+    IFS='|' read -r classification orphan owner session reason <<< "$cls"
+    [[ "$classification" == "gone" ]] && continue
+
+    local owner_json="null"
+    [[ -n "$owner" ]] && owner_json="\"$(json_escape "$owner")\""
+
+    json_items+=("{\"port\":$port,\"pid\":$pid,\"command\":\"$(json_escape "$win")\",\"orphan\":$orphan,\"owner_worktree\":$owner_json,\"classification\":\"$classification\",\"reason\":\"$(json_escape "$reason")\"}")
+  done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2, $9}')
 
   json_array ${json_items[@]+"${json_items[@]}"}
 }
@@ -736,6 +808,18 @@ scan_global() {
 
 # ── Actions ────────────────────────────────────
 
+# SIGTERM grace, by process class.
+grace_for_window() {
+  local window="$1" pat
+  for pat in "${BROWSER_CLASS_PATTERNS[@]}"; do
+    if [[ "$window" == *"$pat"* ]]; then
+      printf '%s' "$BROWSER_GRACE_SECONDS"
+      return 0
+    fi
+  done
+  printf '%s' "$DEFAULT_GRACE_SECONDS"
+}
+
 # do_kill [--consent <pid>]... <pid>...
 #
 #   safe_kill        -> killed unconditionally
@@ -825,15 +909,20 @@ do_kill() {
       log "CONSENTED PID $pid ($reason)"
     fi
 
+    local cmd win grace
+    cmd=$(pid_command "$pid" 2>/dev/null) || cmd=""
+    win=$(command_window "$cmd")
+    grace=$(grace_for_window "$win")
+
     if kill "$pid" 2>/dev/null; then
       local waited=0
-      while (( waited < 5 )) && kill -0 "$pid" 2>/dev/null; do
+      while (( waited < grace )) && kill -0 "$pid" 2>/dev/null; do
         sleep 1
         waited=$((waited + 1))
       done
       if kill -0 "$pid" 2>/dev/null; then
         kill -9 "$pid" 2>/dev/null || true
-        log "SIGKILL PID $pid (SIGTERM failed)"
+        log "SIGKILL PID $pid (SIGTERM ignored after ${grace}s)"
       else
         log "Killed PID $pid"
       fi
@@ -1039,13 +1128,20 @@ case "$ACTION" in
     scan_root=$(current_scan_root)
     if [[ "$flag" == "--global" ]]; then
       zombies=$(scan_zombies "$scan_root")
+      ports=$(scan_ports "$scan_root")
       global=$(scan_global)
-      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"global\":$global}"
+      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"ports\":$ports,\"global\":$global}"
     else
       zombies=$(scan_zombies "$scan_root")
+      ports=$(scan_ports "$scan_root")
       slop=$(scan_slop ".")
-      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"slop\":$slop}"
+      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"ports\":$ports,\"slop\":$slop}"
     fi
+    ;;
+  grace-for)
+    # Seam: the class->grace selection, testable without killing anything.
+    grace_for_window "${1:-}"
+    echo ""
     ;;
   classify)
     # Read-only introspection seam: exposes the classifier for any pid, so the kill matrix is

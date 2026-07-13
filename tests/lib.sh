@@ -16,8 +16,8 @@ CRUSH="$REPO_ROOT/scripts/crush.sh"
 
 PASS=0
 FAIL=0
-SPAWNED=()
 TMPROOT=""
+PIDFILE=""
 REAL_HOME="$HOME"
 
 # ── Fixture lifecycle ──────────────────────────
@@ -27,14 +27,21 @@ setup_tmp() {
   # Isolate HOME: this reroutes CRUSH_LOG and scan_global's ~/.claude entirely into the fixture.
   export HOME="$TMPROOT/home"
   mkdir -p "$HOME/.claude/logs"
+  # Spawned pids go to a FILE, not a shell array. The spawners are called as $(spawn_orphan …),
+  # i.e. in a subshell, so an array append inside them is discarded — nothing would ever be
+  # tracked, and a leaked listener would squat a test port and fail the NEXT run.
+  PIDFILE="$TMPROOT/spawned.pids"
+  : > "$PIDFILE"
 }
 
 cleanup_tmp() {
   local p
-  for p in ${SPAWNED[@]+"${SPAWNED[@]}"}; do
-    [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null
-  done
-  # Fake executables all live under TMPROOT, so this reaps anything still referencing it.
+  if [[ -n "$PIDFILE" && -f "$PIDFILE" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null
+    done < "$PIDFILE"
+  fi
+  # Belt and braces: the fake executables all live under TMPROOT.
   if [[ -n "$TMPROOT" ]]; then
     pkill -9 -f "$TMPROOT" 2>/dev/null
     rm -rf "$TMPROOT" 2>/dev/null
@@ -163,7 +170,10 @@ mk_exec() {
   printf '%s' "$dir/$name"
 }
 
-track_pid() { [[ -n "${1:-}" ]] && SPAWNED+=("$1"); }
+track_pid() {
+  [[ -n "${1:-}" && -n "$PIDFILE" ]] && printf '%s\n' "$1" >> "$PIDFILE"
+  return 0
+}
 
 # Block until a pid has reparented to launchd (ppid == 1). Killing a process's parent makes it
 # an orphan immediately, but "immediately" is not "synchronously with our next ps".
