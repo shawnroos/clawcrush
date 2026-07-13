@@ -6,6 +6,7 @@
 #
 # Usage:
 #   crush.sh scan [--global]                  — scan CWD (or global) for zombies + slop
+#   crush.sh contention                       — READ-ONLY load-contention report
 #   crush.sh classify <pid> [scan_root]       — report one pid's classification (read-only)
 #   crush.sh kill [--consent <pid>]... <pid>… — kill processes, enforcing the kill matrix
 #   crush.sh delete --root <path> <file>...   — delete files, contained under <root>
@@ -806,6 +807,107 @@ scan_global() {
   echo "{\"orphaned_refs\":$refs_json,\"config_backups\":$backups_json,\"plugin_cache\":{\"size\":$cache_size,\"size_fmt\":\"$cache_size_fmt\",\"count\":$cache_count}}"
 }
 
+# ── Scan: Load contention (READ-ONLY) ──────────
+
+# When `ng test` times out at 3 minutes with 0/0 coverage and Chrome disconnects, the cause is
+# usually not the diff — it's N concurrent test runs in SIBLING worktrees. Measured during the
+# audit: load 97.79 on 10 cores.
+#
+# The field-correct action there was to reroute spec validation to CI, NOT to kill the siblings.
+# So this mode diagnoses and attributes; it never acts. Its body contains no kill, no rm, and no
+# state-changing call of any kind — the read-only property is structural, not a promise.
+# It is the natural partner of the ownership guardrail: it tells you the contention is the
+# siblings', and that the answer is CI rather than crushing them.
+scan_contention() {
+  local scan_root="${1:-}"
+  local cores load1 load5 load15 ratio raw p
+
+  cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+  [[ "$cores" =~ ^[0-9]+$ ]] || cores=0
+
+  raw=$(sysctl -n vm.loadavg 2>/dev/null || echo "{ 0.00 0.00 0.00 }")
+  load1=$(printf '%s' "$raw" | awk '{print $2}')
+  load5=$(printf '%s' "$raw" | awk '{print $3}')
+  load15=$(printf '%s' "$raw" | awk '{print $4}')
+  [[ "$load1" =~ ^[0-9.]+$ ]] || load1="0.00"
+  [[ "$load5" =~ ^[0-9.]+$ ]] || load5="0.00"
+  [[ "$load15" =~ ^[0-9.]+$ ]] || load15="0.00"
+
+  if (( cores > 0 )); then
+    ratio=$(awk -v l="$load1" -v c="$cores" 'BEGIN { printf "%.2f", l / c }')
+  else
+    ratio="0.00"
+  fi
+
+  local contend_patterns=()
+  for p in "${DEV_PATTERNS[@]}"; do contend_patterns+=("$p"); done
+  contend_patterns+=("tsc")
+  if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
+    local oldifs="$IFS"
+    IFS=':'
+    for p in $CRUSH_EXTRA_PATTERNS; do
+      [[ -n "$p" ]] && contend_patterns+=("$p")
+    done
+    IFS="$oldifs"
+  fi
+
+  # Collect "owner<TAB>json" rows, then group by owner (bash 3.2: no associative arrays).
+  local rows=()
+  local pid cpu cmd win hit owner
+  while read -r pid cpu cmd; do
+    [[ -z "${pid:-}" || -z "${cmd:-}" ]] && continue
+    [[ "$pid" == "$$" ]] && continue
+    case "$cmd" in
+      *crush.sh*) continue ;;
+    esac
+
+    win=$(command_window "$cmd")
+    hit=""
+    for p in ${contend_patterns[@]+"${contend_patterns[@]}"}; do
+      if [[ "$win" == *"$p"* ]]; then hit="$p"; break; fi
+    done
+    [[ -z "$hit" ]] && continue
+
+    owner=$(owner_worktree_of "$pid" 2>/dev/null) || owner="unknown"
+    [[ -z "$owner" ]] && owner="unknown"
+    [[ "$cpu" =~ ^[0-9.]+$ ]] || cpu="0.0"
+
+    rows+=("${owner}	{\"pid\":$pid,\"command\":\"$(json_escape "$win")\",\"cpu\":$cpu,\"pattern\":\"$(json_escape "$hit")\"}")
+  done < <(ps -eo pid=,%cpu=,command= 2>/dev/null)
+
+  local groups_json=()
+  if (( ${#rows[@]} > 0 )); then
+    local owners owner_key r o procs
+    owners=$(printf '%s\n' "${rows[@]}" | cut -f1 | sort -u)
+    while IFS= read -r owner_key; do
+      [[ -z "$owner_key" ]] && continue
+      procs=()
+      for r in "${rows[@]}"; do
+        o="${r%%	*}"
+        if [[ "$o" == "$owner_key" ]]; then
+          procs+=("${r#*	}")
+        fi
+      done
+      local procs_json
+      procs_json=$(json_array ${procs[@]+"${procs[@]}"})
+      groups_json+=("{\"worktree\":\"$(json_escape "$owner_key")\",\"count\":${#procs[@]},\"procs\":$procs_json}")
+    done <<< "$owners"
+  fi
+
+  # Karma's default port range: more than one listener there is a clash.
+  local karma_clashes
+  karma_clashes=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR>1 {n=$9; sub(/.*:/, "", n); if (n+0 >= 9876 && n+0 <= 9885) print $2}' \
+    | sort -u | wc -l | tr -d ' ')
+  [[ "$karma_clashes" =~ ^[0-9]+$ ]] || karma_clashes=0
+  if (( karma_clashes > 0 )); then karma_clashes=$(( karma_clashes - 1 )); fi
+
+  local groups
+  groups=$(json_array ${groups_json[@]+"${groups_json[@]}"})
+
+  echo "{\"cores\":$cores,\"load\":{\"1\":$load1,\"5\":$load5,\"15\":$load15},\"ratio\":$ratio,\"groups\":$groups,\"karma_port_clashes\":$karma_clashes,\"scan_root\":\"$(json_escape "$scan_root")\"}"
+}
+
 # ── Actions ────────────────────────────────────
 
 # SIGTERM grace, by process class.
@@ -1138,6 +1240,10 @@ case "$ACTION" in
       echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"ports\":$ports,\"slop\":$slop}"
     fi
     ;;
+  contention)
+    scan_root=$(current_scan_root)
+    scan_contention "$scan_root"
+    ;;
   grace-for)
     # Seam: the class->grace selection, testable without killing anything.
     grace_for_window "${1:-}"
@@ -1172,7 +1278,7 @@ case "$ACTION" in
     do_cron
     ;;
   *)
-    echo "Usage: crush.sh {scan [--global] | classify <pid> | kill [--consent <pid>]... <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
+    echo "Usage: crush.sh {scan [--global] | contention | classify <pid> | kill [--consent <pid>]... <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
     exit 1
     ;;
 esac
