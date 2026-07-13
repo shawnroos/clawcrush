@@ -6,12 +6,25 @@
 #
 # Usage:
 #   crush.sh scan [--global]                  — scan CWD (or global) for zombies + slop
-#   crush.sh kill <pid> [pid...]              — kill specific processes (SIGTERM → SIGKILL)
+#   crush.sh classify <pid> [scan_root]       — report one pid's classification (read-only)
+#   crush.sh kill [--consent <pid>]... <pid>… — kill processes, enforcing the kill matrix
 #   crush.sh delete --root <path> <file>...   — delete files, contained under <root>
 #   crush.sh setup-launchagent                — install/verify hourly LaunchAgent
 #   crush.sh cron                             — REPORT-ONLY dry run: logs would-kill candidates
 #
 # CRON IS REPORT-ONLY. It kills nothing. Every line it emits is prefixed `Cron dry-run:`.
+#
+# SAFETY MODEL — age is never sufficient to call a process a zombie. Two axes decide:
+#   liveness  — orphan <=> ppid == 1
+#   ownership — owning worktree (lsof cwd -> git toplevel) + owning claude session
+#
+#                    | orphan (ppid=1)          | attached (live parent)
+#   -----------------+--------------------------+------------------------------
+#   my worktree      | safe_kill                | consent_required
+#   another worktree | safe_kill (+ reported)   | protected — NEVER KILL
+#   owner unknown    | safe_kill (orphan crisp) | consent_required (fail closed)
+#
+# `protected` is refused unconditionally — no flag, including --consent, unlocks it.
 
 set -euo pipefail
 
@@ -44,6 +57,28 @@ MCP_PATTERNS=(
 
 # Generic runtimes: only ever candidates when ALREADY orphaned (ppid=1) AND old.
 ORPHAN_RUNTIME_PATTERNS=("node" "bun" "chromium" "chrome")
+
+# Which ancestor command shapes count as a LIVE Claude session. This is the one fuzzy seam in
+# the model — the crisp decision (the kill matrix) is fully deterministic downstream.
+# Verified live shapes: ".../ClaudeCode.app/Contents/MacOS/claude --bg-pty-host …".
+# Drift shows up as attached processes classifying consent_required (fail closed), never as a
+# false safe_kill.
+CRUSH_SESSION_RE=${CRUSH_SESSION_RE:-'(^|[/[:space:]])claude([[:space:]]|$)'}
+
+# Never killed, at any classification, orphaned or not. Killing a mid-flight install corrupts
+# node_modules and the lockfile; killing a language server takes the editor down with it.
+NEVER_KILL_PATTERNS=(
+  "npm install"
+  "npm ci"
+  "npm exec"
+  "pnpm install"
+  "pnpm add"
+  "yarn install"
+  "yarn add"
+  "tsserver"
+  "typescript-language-server"
+  "language-server"
+)
 
 SLOP_EXTENSIONS=("log" "bak" "orig" "backup")
 SLOP_PREFIXES=("temp-" "scratch-" "debug-" "untitled")
@@ -188,14 +223,204 @@ matches_crushignore() {
   return 1
 }
 
+# ── Process attribution: the two-axis model ────
+#
+#   LIVENESS  — orphan <=> ppid == 1. Reparenting to launchd is immediate on parent death, so
+#               "no live parent" is exactly ppid==1. Crisp; not a heuristic.
+#   OWNERSHIP — which worktree owns the process (lsof cwd -> git toplevel), and which live
+#               claude session, if any, is its ancestor.
+#
+# Age is NOT an axis. It is metadata and the cron gate. A long-running `ng serve` is by
+# definition old and by definition alive — that is the whole point.
+
+# Window a ps command line to its command HEAD: argv[0] plus following non-flag words, stopping
+# at the first flag. Without this, `grep -F` matched the whole ps line including arguments, so
+# `tail -f /tmp/x-playwright-mcp.log` read as an MCP server (F7).
+command_window() {
+  local cmd="$1" out="" tok count=0
+  set -f
+  for tok in $cmd; do
+    case "$tok" in
+      -*) break ;;
+    esac
+    if [[ -z "$out" ]]; then out="$tok"; else out="$out $tok"; fi
+    count=$((count + 1))
+    if (( count >= 8 )); then break; fi
+  done
+  set +f
+  printf '%s' "$out"
+}
+
+pid_command() {
+  local line
+  line=$(ps -o command= -p "$1" 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+  printf '%s' "$line"
+}
+
+pid_ppid() {
+  local v
+  v=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ') || return 1
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
+}
+
+# This script's own ancestor chain. Anything in it is PROTECTED — clawcrush must never kill its
+# own host (the `node`/`chrome` patterns could otherwise match the session running it).
+OWN_ANCESTORS=""
+compute_own_ancestors() {
+  local p="$$" guard=0
+  while [[ -n "$p" && "$p" != "0" && "$p" != "1" ]] && (( guard < 64 )); do
+    OWN_ANCESTORS="$OWN_ANCESTORS $p "
+    p=$(pid_ppid "$p" 2>/dev/null) || p=""
+    guard=$((guard + 1))
+  done
+}
+compute_own_ancestors
+
+in_own_tree() {
+  [[ "$OWN_ANCESTORS" == *" $1 "* ]]
+}
+
+matches_never_kill() {
+  local window="$1" pat
+  for pat in "${NEVER_KILL_PATTERNS[@]}"; do
+    if [[ "$window" == *"$pat"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The git worktree containing a directory.
+worktree_of() {
+  local dir="$1" top
+  [[ -d "$dir" ]] || return 1
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ -n "$top" ]] || return 1
+  printf '%s' "$top"
+}
+
+current_scan_root() {
+  local top
+  if top=$(worktree_of "$PWD"); then
+    printf '%s' "$top"
+  else
+    printf '%s' "$PWD"
+  fi
+}
+
+# Walk ancestors for a live Claude session. Prints its pid, or fails.
+owning_session_of() {
+  local p guard=0 cmd win
+  p=$(pid_ppid "$1" 2>/dev/null) || return 1
+  while [[ -n "$p" && "$p" != "0" && "$p" != "1" ]] && (( guard < 64 )); do
+    cmd=$(pid_command "$p" 2>/dev/null) || cmd=""
+    if [[ -n "$cmd" ]]; then
+      win=$(command_window "$cmd")
+      if [[ "$win" =~ $CRUSH_SESSION_RE ]]; then
+        printf '%s' "$p"
+        return 0
+      fi
+    fi
+    p=$(pid_ppid "$p" 2>/dev/null) || p=""
+    guard=$((guard + 1))
+  done
+  return 1
+}
+
+# The worktree that owns a process, via its cwd. Fails when unresolvable — and unresolvable
+# always means "fail closed", never "assume mine".
+owner_worktree_of() {
+  local cwd top
+  cwd=$(lsof -a -p "$1" -d cwd -Fn 2>/dev/null | grep '^n' | head -1 | sed 's/^n//') || return 1
+  [[ -n "$cwd" && -d "$cwd" ]] || return 1
+  top=$(worktree_of "$cwd") || return 1
+  printf '%s' "$top"
+}
+
+# classify_pid <pid> [scan_root] -> classification|orphan|owner_worktree|owning_session|reason
+#
+# The kill matrix, in one place, computed at scan time AND re-derived at act time:
+#
+#                    | orphan (ppid=1)          | attached (live parent)
+#   -----------------+--------------------------+------------------------------
+#   my worktree      | safe_kill                | consent_required
+#   another worktree | safe_kill (+ reported)   | protected — NEVER KILL
+#   owner unknown    | safe_kill (orphan crisp) | consent_required (fail closed)
+#
+# Own process tree and the never-kill allowlist are not separate features — they are the same
+# predicate, short-circuiting to protected.
+classify_pid() {
+  local pid="$1"
+  local scan_root="${2:-}"
+  local cmd win ppid orphan owner session reason
+
+  cmd=$(pid_command "$pid" 2>/dev/null) || { printf 'gone|false|||process no longer exists'; return 0; }
+  win=$(command_window "$cmd")
+
+  if in_own_tree "$pid"; then
+    printf 'protected|false|||in clawcrush own process tree'
+    return 0
+  fi
+
+  if matches_never_kill "$win"; then
+    printf 'protected|false|||never-kill allowlist'
+    return 0
+  fi
+
+  ppid=$(pid_ppid "$pid" 2>/dev/null) || ppid=""
+  if [[ "$ppid" == "1" ]]; then orphan="true"; else orphan="false"; fi
+
+  owner=$(owner_worktree_of "$pid" 2>/dev/null) || owner=""
+  session=$(owning_session_of "$pid" 2>/dev/null) || session=""
+
+  if [[ "$orphan" == "true" ]]; then
+    reason="ppid=1 (orphaned)"
+    [[ -n "$owner" ]] && reason="ppid=1 (orphaned), owner: $owner"
+    printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
+    return 0
+  fi
+
+  if [[ -z "$owner" ]]; then
+    printf 'consent_required|false||%s|attached (ppid=%s), owner unresolvable — fail closed' "$session" "$ppid"
+    return 0
+  fi
+
+  if [[ -n "$scan_root" && "$owner" == "$scan_root" ]]; then
+    reason="attached (ppid=$ppid) in this worktree"
+    [[ -n "$session" ]] && reason="attached to live claude (pid $session), owner: $owner"
+    printf 'consent_required|false|%s|%s|%s' "$owner" "$session" "$reason"
+    return 0
+  fi
+
+  reason="attached (ppid=$ppid), owner: $owner (another worktree)"
+  [[ -n "$session" ]] && reason="attached to live claude (pid $session), owner: $owner (another worktree)"
+  printf 'protected|false|%s|%s|%s' "$owner" "$session" "$reason"
+}
+
 # ── Scan: Processes ────────────────────────────
 
 # Emit one row per process candidate:
-#   pid|ppid|age_mins|age_fmt|name|pattern|reason
+#   pid|ppid|age_mins|age_fmt|name|pattern|classification|orphan|owner|session|reason
 # Single source of truth for both `scan` (JSON) and `cron` (dry-run log).
 zombie_rows() {
+  local scan_root="${1:-}"
   local seen=" "
-  local pid ppid etime cmd p
+  local pid ppid etime cmd win p
+
+  # The pattern list. CRUSH_EXTRA_PATTERNS is a harness-only seam for smoke patterns that
+  # should not ship as real detection rules.
+  local patterns=()
+  for p in "${MCP_PATTERNS[@]}"; do patterns+=("$p"); done
+  if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
+    local oldifs="$IFS"
+    IFS=':'
+    for p in $CRUSH_EXTRA_PATTERNS; do
+      [[ -n "$p" ]] && patterns+=("$p")
+    done
+    IFS="$oldifs"
+  fi
 
   # ONE ps call, matched in-process. The old code ran `ps | grep | awk` once per pattern and
   # then forked three more subshells per matched line to split the fields.
@@ -207,10 +432,13 @@ zombie_rows() {
     esac
     [[ "$seen" == *" $pid "* ]] && continue
 
-    local name="" pattern="" reason=""
+    # Match on the command HEAD, not the whole ps line (F7).
+    win=$(command_window "$cmd")
 
-    for p in "${MCP_PATTERNS[@]}"; do
-      if [[ "$cmd" == *"$p"* ]]; then
+    local name="" pattern=""
+
+    for p in ${patterns[@]+"${patterns[@]}"}; do
+      if [[ "$win" == *"$p"* ]]; then
         pattern="$p"
         name="${p#mcp-}"
         name="${name%% *}"
@@ -218,23 +446,12 @@ zombie_rows() {
       fi
     done
 
-    if [[ -n "$pattern" ]]; then
-      set_age "$etime"
-      # NOTE (F1): age alone is still sufficient here. That is the zero-precision predicate —
-      # U1 replaces it with the two-axis classifier. U0 only disarms what ACTS on it.
-      if [[ "$ppid" == "1" ]]; then
-        reason="ppid=1 (orphaned)"
-      elif (( _AGE_MINS >= MIN_AGE_MINUTES )); then
-        reason="age > ${MIN_AGE_MINUTES}m"
-      else
-        continue
-      fi
-    else
-      # Generic runtimes: candidates ONLY when already orphaned AND old (the correct AND model
-      # that already existed in the second loop).
+    if [[ -z "$pattern" ]]; then
+      # Generic runtimes are too broad to report while attached — they'd list every node
+      # process on the machine. They stay gated on orphan AND age.
       [[ "$ppid" != "1" ]] && continue
       for p in "${ORPHAN_RUNTIME_PATTERNS[@]}"; do
-        if [[ "$cmd" =~ (^|[/[:space:]])"$p"([[:space:]]|$) ]]; then
+        if [[ "$win" =~ (^|[/[:space:]])"$p"([[:space:]]|$) ]]; then
           pattern="$p (orphaned)"
           name="$p"
           break
@@ -243,24 +460,43 @@ zombie_rows() {
       [[ -z "$pattern" ]] && continue
       set_age "$etime"
       (( _AGE_MINS < MIN_AGE_MINUTES )) && continue
-      reason="ppid=1 + age > ${MIN_AGE_MINUTES}m"
+    else
+      set_age "$etime"
     fi
 
+    # EVERY candidate is reported and carries a classification. Age no longer decides anything:
+    # the old `elif age >= 60` made a live, actively-used MCP server a "zombie" at 61 minutes
+    # and clean at 59 — a detector whose output was a pure function of session age (F1).
+    local cls classification orphan owner session reason
+    cls=$(classify_pid "$pid" "$scan_root")
+    IFS='|' read -r classification orphan owner session reason <<< "$cls"
+
+    # Vanished between ps and classify — not reportable.
+    [[ "$classification" == "gone" ]] && continue
+
     seen="$seen$pid "
-    printf '%s|%s|%s|%s|%s|%s|%s\n' \
-      "$pid" "$ppid" "$_AGE_MINS" "$_AGE_FMT" "$name" "$pattern" "$reason"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$pid" "$ppid" "$_AGE_MINS" "$_AGE_FMT" "$name" "$pattern" \
+      "$classification" "$orphan" "$owner" "$session" "$reason"
   done < <(ps -eo pid=,ppid=,etime=,command= 2>/dev/null)
 }
 
 scan_zombies() {
+  local scan_root="${1:-}"
   local json_items=()
-  local row pid ppid age_mins age_fmt name pattern reason
+  local row pid ppid age_mins age_fmt name pattern classification orphan owner session reason
 
   while IFS= read -r row; do
     [[ -z "$row" ]] && continue
-    IFS='|' read -r pid ppid age_mins age_fmt name pattern reason <<< "$row"
-    json_items+=("{\"pid\":$pid,\"name\":\"$(json_escape "$name")\",\"pattern\":\"$(json_escape "$pattern")\",\"age\":\"$age_fmt\",\"age_mins\":$age_mins,\"ppid\":$ppid,\"reason\":\"$(json_escape "$reason")\"}")
-  done < <(zombie_rows)
+    IFS='|' read -r pid ppid age_mins age_fmt name pattern classification orphan owner session reason <<< "$row"
+
+    local owner_json="null"
+    [[ -n "$owner" ]] && owner_json="\"$(json_escape "$owner")\""
+    local session_json="null"
+    [[ -n "$session" ]] && session_json="$session"
+
+    json_items+=("{\"pid\":$pid,\"name\":\"$(json_escape "$name")\",\"pattern\":\"$(json_escape "$pattern")\",\"age\":\"$age_fmt\",\"age_mins\":$age_mins,\"ppid\":$ppid,\"orphan\":$orphan,\"owner_worktree\":$owner_json,\"owning_session\":$session_json,\"classification\":\"$classification\",\"reason\":\"$(json_escape "$reason")\"}")
+  done < <(zombie_rows "$scan_root")
 
   json_array ${json_items[@]+"${json_items[@]}"}
 }
@@ -500,11 +736,95 @@ scan_global() {
 
 # ── Actions ────────────────────────────────────
 
+# do_kill [--consent <pid>]... <pid>...
+#
+#   safe_kill        -> killed unconditionally
+#   consent_required -> killed ONLY with an explicit per-pid --consent
+#   protected        -> REFUSED unconditionally. No flag, including --consent, unlocks it.
+#                       There is no caller-reachable path to kill a protected pid.
+#
+# The classification is re-derived here, immediately before signalling, not trusted from the
+# scan — lowfat scans, renders a table, and waits on a human, and macOS recycles pids.
+#
+# --consent may only ever be constructed from an explicit per-item human selection (lowfat's
+# AskUserQuestion). fullcream never passes it. The engine cannot verify a flag's provenance,
+# so that rule is enforced by review at the command layer, not here.
 do_kill() {
-  local killed=0
-  local failed=0
+  local scan_root
+  scan_root=$(current_scan_root)
 
-  for pid in "$@"; do
+  local consent=" "
+  local listed=" "
+  local pids=()
+
+  # `--consent <pid>` BOTH names the pid and consents to it. It never merely annotates a pid
+  # supplied elsewhere, so a caller cannot accidentally consent to something it did not list.
+  while (( $# > 0 )); do
+    case "$1" in
+      --consent)
+        local c="${2:-}"
+        if [[ ! "$c" =~ ^[0-9]+$ ]]; then
+          log "BLOCKED invalid --consent value: '${c}'"
+          echo "{\"killed\":0,\"failed\":0,\"refused\":0,\"error\":\"invalid --consent value\"}" >&2
+          return 2
+        fi
+        consent="$consent$c "
+        if [[ "$listed" != *" $c "* ]]; then
+          listed="$listed$c "
+          pids+=("$c")
+        fi
+        shift 2
+        ;;
+      *)
+        # Positive integers only. A negative arg is a process-GROUP kill (F7).
+        if [[ ! "$1" =~ ^[0-9]+$ ]]; then
+          log "BLOCKED invalid pid argument: '$1'"
+          echo "{\"killed\":0,\"failed\":0,\"refused\":0,\"error\":\"invalid pid argument\"}" >&2
+          return 2
+        fi
+        if [[ "$listed" != *" $1 "* ]]; then
+          listed="$listed$1 "
+          pids+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if (( ${#pids[@]} == 0 )); then
+    echo "{\"killed\":0,\"failed\":0,\"refused\":0,\"error\":\"no pids\"}" >&2
+    return 2
+  fi
+
+  local killed=0 failed=0 refused=0
+  local pid
+
+  for pid in "${pids[@]}"; do
+    local cls classification orphan owner session reason
+    cls=$(classify_pid "$pid" "$scan_root")
+    IFS='|' read -r classification orphan owner session reason <<< "$cls"
+
+    if [[ "$classification" == "gone" ]]; then
+      failed=$((failed + 1))
+      log "Skipped PID $pid (no longer exists)"
+      continue
+    fi
+
+    if [[ "$classification" == "protected" ]]; then
+      refused=$((refused + 1))
+      log "REFUSED PID $pid — protected ($reason)"
+      continue
+    fi
+
+    if [[ "$classification" == "consent_required" ]]; then
+      if [[ "$consent" != *" $pid "* ]]; then
+        refused=$((refused + 1))
+        log "REFUSED PID $pid — consent_required, no --consent given ($reason)"
+        continue
+      fi
+      log "CONSENTED PID $pid ($reason)"
+    fi
+
     if kill "$pid" 2>/dev/null; then
       local waited=0
       while (( waited < 5 )) && kill -0 "$pid" 2>/dev/null; do
@@ -524,7 +844,11 @@ do_kill() {
     fi
   done
 
-  echo "{\"killed\":$killed,\"failed\":$failed}"
+  echo "{\"killed\":$killed,\"failed\":$failed,\"refused\":$refused}"
+  if (( refused > 0 )); then
+    return 3
+  fi
+  return 0
 }
 
 # do_delete --root <path> <target>...
@@ -688,16 +1012,23 @@ PLIST
 # session's MCP servers. It is now report-only and kills nothing. Re-arming is out of scope.
 do_cron() {
   local count=0
-  local row pid ppid age_mins age_fmt name pattern reason
+  local row pid ppid age_mins age_fmt name pattern classification orphan owner session reason
 
   while IFS= read -r row; do
     [[ -z "$row" ]] && continue
-    IFS='|' read -r pid ppid age_mins age_fmt name pattern reason <<< "$row"
-    log "Cron dry-run: would-kill pid $pid name=$name age=$age_fmt reason=$reason"
-    count=$((count + 1))
-  done < <(zombie_rows)
+    IFS='|' read -r pid ppid age_mins age_fmt name pattern classification orphan owner session reason <<< "$row"
 
-  log "Cron dry-run: $count candidate(s); killed 0 (report-only)"
+    # Cron is unattended and has no consent path, so it may only ever consider genuine orphans
+    # past the age gate — the same posture fullcream has. consent_required and protected
+    # candidates are dropped from the log entirely, not merely left unkilled.
+    [[ "$classification" != "safe_kill" ]] && continue
+    (( age_mins < MIN_AGE_MINUTES )) && continue
+
+    log "Cron dry-run: would-kill pid $pid name=$name age=$age_fmt owner=${owner:-unknown} reason=$reason"
+    count=$((count + 1))
+  done < <(zombie_rows "")
+
+  log "Cron dry-run: $count safe_kill candidate(s) past the age gate; killed 0 (report-only)"
 }
 
 # ── Main dispatch ──────────────────────────────
@@ -705,15 +1036,32 @@ do_cron() {
 case "$ACTION" in
   scan)
     flag="${1:-}"
+    scan_root=$(current_scan_root)
     if [[ "$flag" == "--global" ]]; then
-      zombies=$(scan_zombies)
+      zombies=$(scan_zombies "$scan_root")
       global=$(scan_global)
-      echo "{\"zombies\":$zombies,\"global\":$global}"
+      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"global\":$global}"
     else
-      zombies=$(scan_zombies)
+      zombies=$(scan_zombies "$scan_root")
       slop=$(scan_slop ".")
-      echo "{\"zombies\":$zombies,\"slop\":$slop}"
+      echo "{\"scan_root\":\"$(json_escape "$scan_root")\",\"zombies\":$zombies,\"slop\":$slop}"
     fi
+    ;;
+  classify)
+    # Read-only introspection seam: exposes the classifier for any pid, so the kill matrix is
+    # directly testable rather than only observable through a scan's pattern list.
+    pid="${1:-}"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+      echo "Usage: crush.sh classify <pid> [scan_root]" >&2
+      exit 1
+    fi
+    root="${2:-$(current_scan_root)}"
+    cls=$(classify_pid "$pid" "$root")
+    IFS='|' read -r classification orphan owner session reason <<< "$cls"
+    owner_json="null"; [[ -n "$owner" ]] && owner_json="\"$(json_escape "$owner")\""
+    session_json="null"; [[ -n "$session" ]] && session_json="$session"
+    [[ -z "$orphan" ]] && orphan="false"
+    echo "{\"pid\":$pid,\"classification\":\"$classification\",\"orphan\":$orphan,\"owner_worktree\":$owner_json,\"owning_session\":$session_json,\"reason\":\"$(json_escape "$reason")\"}"
     ;;
   kill)
     do_kill "$@"
@@ -728,7 +1076,7 @@ case "$ACTION" in
     do_cron
     ;;
   *)
-    echo "Usage: crush.sh {scan [--global] | kill <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
+    echo "Usage: crush.sh {scan [--global] | classify <pid> | kill [--consent <pid>]... <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
     exit 1
     ;;
 esac

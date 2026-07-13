@@ -165,6 +165,31 @@ mk_exec() {
 
 track_pid() { [[ -n "${1:-}" ]] && SPAWNED+=("$1"); }
 
+# Block until a pid has reparented to launchd (ppid == 1). Killing a process's parent makes it
+# an orphan immediately, but "immediately" is not "synchronously with our next ps".
+wait_ppid1() {
+  local pid="$1" i=0 pp
+  while (( i < 60 )); do
+    pp=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [[ "$pp" == "1" ]] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# The zombie entry for a pid, as JSON ("null" when the scan did not report it at all).
+zombie_for() {
+  local scan_json="$1" pid="$2"
+  printf '%s' "$scan_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+pid = int(sys.argv[1])
+hit = [z for z in d["zombies"] if z["pid"] == pid]
+print(json.dumps(hit[0]) if hit else "null")
+' "$pid" 2>/dev/null
+}
+
 # spawn_orphan <cwd> <exe> [args...] -> prints the child pid (ppid == 1)
 # The launcher exits immediately after backgrounding the child, so the child reparents to
 # launchd. Verified: reparenting to ppid 1 is immediate on parent death.
