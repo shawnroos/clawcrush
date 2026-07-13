@@ -138,6 +138,20 @@ else
     "protected" "$(json_get "$out" 'd["classification"]')"
 fi
 
+# ...but the allowlist must stay NARROW. `npm exec` (npx) is how most MCP servers are launched
+# (`npm exec mcp-remote …` — 17 of them are running on this machine right now), so allowlisting the
+# npm binary broadly would make every npx-launched MCP server permanently unkillable, orphans
+# included. An over-broad allowlist entry is a precision leak wearing a safety feature's clothes.
+npx_pid=$(spawn_orphan "$wt_a" "$npm_exec" exec mcp-remote https://example.test/mcp)
+
+if [[ -z "$npx_pid" ]]; then
+  nok "allowlist: could not mint the npx-launched MCP candidate (harness failure)"
+else
+  out=$(crush_in "$wt_a" classify "$npx_pid" 2>/dev/null)
+  expect_eq "allowlist: an ORPHANED npx-launched MCP server IS reclaimable (not allowlisted)" \
+    "safe_kill" "$(json_get "$out" 'd["classification"]')"
+fi
+
 # ── Windowed matching: an argument is not a command ───────────────────────────────────────
 # `tail -f …/x-playwright-mcp.log` merely MENTIONS a pattern. Matching the whole ps line
 # (arguments included) flagged it as an MCP server.

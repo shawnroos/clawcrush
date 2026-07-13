@@ -92,12 +92,19 @@ PORT_EXTRA=9222
 # false safe_kill.
 CRUSH_SESSION_RE=${CRUSH_SESSION_RE:-'(^|[/[:space:]])claude([[:space:]]|$)'}
 
-# Never killed, at any classification, orphaned or not. Killing a mid-flight install corrupts
-# node_modules and the lockfile; killing a language server takes the editor down with it.
+# Never killed, at any classification, orphaned or not.
+#
+# The bar is narrow and specific: killing a mid-flight INSTALL corrupts node_modules and the
+# lockfile, and killing a language server takes the editor down with it. Nothing else qualifies.
+#
+# `npm exec` (i.e. npx) deliberately does NOT belong here, even though it is an npm subcommand:
+# it is how most MCP servers are launched (`npm exec mcp-remote …`), so allowlisting it would make
+# every npx-launched MCP server permanently unkillable — including genuinely orphaned ones, which
+# are exactly what clawcrush exists to reclaim. An over-broad allowlist entry is a precision leak
+# that hides as a safety feature.
 NEVER_KILL_PATTERNS=(
   "npm install"
   "npm ci"
-  "npm exec"
   "pnpm install"
   "pnpm add"
   "yarn install"
