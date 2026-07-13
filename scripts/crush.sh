@@ -8,6 +8,7 @@
 #   crush.sh scan [--global]                  — scan CWD (or global) for zombies + slop
 #   crush.sh contention                       — READ-ONLY load-contention report
 #   crush.sh classify <pid> [scan_root]       — report one pid's classification (read-only)
+#   crush.sh session-re <command line>        — is this a live-claude session shape? (read-only)
 #   crush.sh kill [--consent <pid>]... <pid>… — kill processes, enforcing the kill matrix
 #   crush.sh delete --root <path> <file>...   — delete files, contained under <root>
 #   crush.sh setup-launchagent                — install/verify hourly LaunchAgent
@@ -16,14 +17,21 @@
 # CRON IS REPORT-ONLY. It kills nothing. Every line it emits is prefixed `Cron dry-run:`.
 #
 # SAFETY MODEL — age is never sufficient to call a process a zombie. Two axes decide:
-#   liveness  — orphan <=> ppid == 1
-#   ownership — owning worktree (lsof cwd -> git toplevel) + owning claude session
+#   liveness  — ppid == 1 AND (an owning worktree OR a session-child signature). ppid==1 alone is
+#               NOT orphanhood: launchd-managed jobs are ppid==1 for their entire life.
+#   ownership — owning worktree (lsof cwd -> git toplevel) AND owning claude session. A live
+#               session that is not MINE outranks the worktree — sessions share repo roots.
 #
-#                    | orphan (ppid=1)          | attached (live parent)
-#   -----------------+--------------------------+------------------------------
-#   my worktree      | safe_kill                | consent_required
-#   another worktree | safe_kill (+ reported)   | protected — NEVER KILL
-#   owner unknown    | safe_kill (orphan crisp) | consent_required (fail closed)
+#                        | orphan (ppid=1)        | attached (live parent)
+#   ---------------------+------------------------+------------------------------
+#   my worktree          | safe_kill              | consent_required
+#   another worktree     | safe_kill (+ reported) | protected — NEVER KILL
+#   another live session | safe_kill              | protected — NEVER KILL (any worktree)
+#   owner unknown        | see below              | consent_required (fail closed)
+#
+# "owner unknown + orphan" splits on the session-child signature:
+#   named MCP server / dev-stack process -> safe_kill (its session is provably gone)
+#   generic runtime, no worktree          -> protected (launchd/daemon shape; never killed)
 #
 # `protected` is refused unconditionally — no flag, including --consent, unlocks it.
 
@@ -71,8 +79,29 @@ DEV_PATTERNS=(
   "esbuild"
 )
 
-# Generic runtimes: only ever candidates when ALREADY orphaned (ppid=1) AND old.
-ORPHAN_RUNTIME_PATTERNS=("node" "bun" "chromium" "chrome")
+# Generic runtimes: only ever candidates when ALREADY orphaned (ppid=1) AND old AND owned by a
+# resolvable worktree (see classify_pid's daemon guard). They carry NO session-child signature, so
+# ppid==1 on one of them is not evidence of abandonment on its own.
+#
+# The capitalized entries are the REAL macOS executable names — `/Applications/Google Chrome.app/
+# Contents/MacOS/Google Chrome`, not `chrome`. Matching is case-sensitive (window_matches_pattern),
+# so the lowercase entries alone made the single most common leaked-browser shape on macOS
+# invisible to the scanner, while BROWSER_CLASS_PATTERNS below already used the real names — the
+# two lists disagreed about what a browser is called, and the one gating KILL CANDIDACY had it
+# wrong. The lowercase forms are kept for Linux/CI shapes.
+#
+# These names are only safe to carry here BECAUSE of the daemon guard: a Dock-launched Google
+# Chrome is ppid==1 for its entire life. Under a bare `orphan <=> ppid==1` rule, listing it here
+# would make the user's actual browser safe_kill and fullcream would close it.
+ORPHAN_RUNTIME_PATTERNS=(
+  "node"
+  "bun"
+  "chromium"
+  "chrome"
+  "Chromium"
+  "Google Chrome"
+  "Google Chrome Helper"
+)
 
 # TERM-resistant browsers: karma/Chrome empirically survive SIGTERM and always needed -9, so
 # waiting the full 5s on them just delays the SIGKILL that was always coming.
@@ -87,10 +116,29 @@ PORT_EXTRA=9222
 
 # Which ancestor command shapes count as a LIVE Claude session. This is the one fuzzy seam in
 # the model — the crisp decision (the kill matrix) is fully deterministic downstream.
-# Verified live shapes: ".../ClaudeCode.app/Contents/MacOS/claude --bg-pty-host …".
-# Drift shows up as attached processes classifying consent_required (fail closed), never as a
-# false safe_kill.
-CRUSH_SESSION_RE=${CRUSH_SESSION_RE:-'(^|[/[:space:]])claude([[:space:]]|$)'}
+#
+# The previous pattern required `claude` to be followed by whitespace or end-of-string, so it
+# matched the pty-host WRAPPER (".../MacOS/claude --bg-pty-host …") but NOT the agent process that
+# actually spawns MCP servers, whose command window is a bare PATH:
+#
+#   /Users/x/.local/share/claude/versions/2.1.207     ← `claude` is followed by `/`. NO MATCH.
+#
+# For an interactive session that was survivable — the walk continued past the agent and hit the
+# wrapper. But a swarm/subagent session (`versions/2.1.207 --agent-id …`) is parented by tmux, so
+# the version binary is the ONLY claude process in the chain and the walk fell through to ppid 1.
+# Measured on this machine: 46 of 76 live MCP servers reported owning_session:null. The session
+# axis was dead for exactly the processes it exists to attribute.
+#
+# So: match `claude` as a path COMPONENT (allowing a trailing `/`), plus the version-binary shape.
+# Over-matching here is safe by construction — a spurious session hit only ever moves a process
+# toward `protected` (see classify_pid), never toward safe_kill.
+#
+# Verified live shapes (all four are pinned by a table-driven runtime test):
+#   /Users/x/.local/share/claude/versions/2.1.207
+#   /Users/x/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host …
+#   /Users/x/.local/bin/claude daemon run …
+#   claude bg-pty-host …
+CRUSH_SESSION_RE=${CRUSH_SESSION_RE:-'(^|[/[:space:]])claude([/[:space:]]|$)|/share/claude/versions/'}
 
 # Never killed, at any classification, orphaned or not.
 #
@@ -129,9 +177,50 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CRUSH_LOG"
 }
 
-# JSON string escaping: backslashes FIRST, then quotes (F7).
+# JSON string escaping: backslashes FIRST, then quotes (F7), then the C0 control range.
+#
+# The old form ended in `tr -d '\n'`, which STRIPPED newlines instead of escaping them, and passed
+# every other control character through raw. Both are corruption, not cosmetics:
+#   - a raw control char in ONE filename makes the ENTIRE scan document invalid JSON, and every
+#     command mode that parses it goes blind;
+#   - a stripped newline means the emitted path is a DIFFERENT STRING than the real filename — a
+#     delete target that no longer names the file that was scanned.
+# `git ls-files -z` hands us both shapes verbatim, so neither is hypothetical.
+#
+# Builtins only, no forks. The old version forked sed AND tr on every call, and this is the hot
+# path (several calls per process row, on a box whose defining condition is that it is contended).
+# The fast path — no backslash, no quote, no control char — is the overwhelming majority and now
+# costs zero subshells.
 json_escape() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'
+  local s="$1"
+  if [[ "$s" != *\\* && "$s" != *\"* && ! "$s" =~ [[:cntrl:]] ]]; then
+    printf '%s' "$s"
+    return 0
+  fi
+
+  local out="" i c esc n=${#s}
+  for (( i = 0; i < n; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      '\')      out="$out\\\\" ;;
+      '"')      out="$out\\\"" ;;
+      $'\t')    out="$out\\t" ;;
+      $'\n')    out="$out\\n" ;;
+      $'\r')    out="$out\\r" ;;
+      $'\b')    out="$out\\b" ;;
+      $'\f')    out="$out\\f" ;;
+      *)
+        if [[ "$c" =~ [[:cntrl:]] ]]; then
+          # Any remaining C0 char: \u00XX. JSON forbids these raw inside a string.
+          printf -v esc '\\u%04x' "'$c"
+          out="$out$esc"
+        else
+          out="$out$c"
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 
 # Join pre-built JSON object strings into an array. Safe with ZERO args — this is the
@@ -363,6 +452,35 @@ matches_never_kill() {
   return 1
 }
 
+# Does this window carry a SESSION-CHILD signature — a named MCP server, or a dev-stack process?
+#
+# This is the discriminator the daemon guard in classify_pid turns on. A named MCP server or an
+# `ng test` is, by construction, spawned BY a Claude session and inherits its cwd; ppid==1 on one
+# of those really does mean the session that owned it is gone. A generic runtime (node, bun, a
+# browser) carries no such signature — it is equally likely to be a launchd-managed service that
+# has had ppid==1 since boot.
+matches_specific_pattern() {
+  local win="$1" p
+  for p in "${MCP_PATTERNS[@]}"; do
+    if window_matches_pattern "$win" "$p"; then return 0; fi
+  done
+  for p in "${DEV_PATTERNS[@]}"; do
+    if window_matches_pattern "$win" "$p"; then return 0; fi
+  done
+  if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
+    local oldifs="$IFS"
+    IFS=':'
+    for p in $CRUSH_EXTRA_PATTERNS; do
+      if [[ -n "$p" ]] && window_matches_pattern "$win" "$p"; then
+        IFS="$oldifs"
+        return 0
+      fi
+    done
+    IFS="$oldifs"
+  fi
+  return 1
+}
+
 # The git worktree containing a directory.
 worktree_of() {
   local dir="$1" top
@@ -412,16 +530,20 @@ owner_worktree_of() {
 
 # classify_pid <pid> [scan_root] -> classification|orphan|owner_worktree|owning_session|reason
 #
-# The kill matrix, in one place, computed at scan time AND re-derived at act time:
+# The kill matrix, in one place, computed at scan time AND re-derived at act time. Every guard
+# below lives HERE and not in the callers, because `crush.sh kill <pid>` is reachable by the
+# command layer with an arbitrary pid — a guard that only gates DETECTION (zombie_rows) leaves the
+# act path wide open to a drifted or hallucinating caller.
 #
-#                    | orphan (ppid=1)          | attached (live parent)
-#   -----------------+--------------------------+------------------------------
-#   my worktree      | safe_kill                | consent_required
-#   another worktree | safe_kill (+ reported)   | protected — NEVER KILL
-#   owner unknown    | safe_kill (orphan crisp) | consent_required (fail closed)
+#                        | orphan (ppid=1)        | attached (live parent)
+#   ---------------------+------------------------+------------------------------
+#   my worktree          | safe_kill              | consent_required
+#   another worktree     | safe_kill (+ reported) | protected — NEVER KILL
+#   another live session | safe_kill              | protected — NEVER KILL (any worktree)
+#   owner unknown        | signature-dependent    | consent_required (fail closed)
 #
-# Own process tree and the never-kill allowlist are not separate features — they are the same
-# predicate, short-circuiting to protected.
+# Own process tree, the never-kill allowlist, the daemon guard and the foreign-session guard are
+# not four features — they are the same predicate, short-circuiting to protected.
 classify_pid() {
   local pid="$1"
   local scan_root="${2:-}"
@@ -447,9 +569,43 @@ classify_pid() {
   session=$(owning_session_of "$pid" 2>/dev/null) || session=""
 
   if [[ "$orphan" == "true" ]]; then
+    # THE DAEMON GUARD. ppid==1 is NECESSARY for orphanhood but never SUFFICIENT.
+    #
+    # launchd-managed jobs (brew services, user LaunchAgents) and self-daemonized processes run
+    # with ppid==1 for their ENTIRE LIFE — launchd is their designed parent, not the residue of a
+    # dead one. A bare `orphan <=> ppid==1` rule therefore reads a healthy system service as an
+    # abandoned one, and it is the SAME defect shape as F1: a signal that is a pure function of
+    # process lifecycle rather than of abandonment.
+    #
+    # The discriminator is the cwd. An abandoned session child still sits in the worktree it was
+    # spawned in; a daemon's cwd is `/`, its own install dir, or unreadable — never a git worktree.
+    # So an orphan is only autonomously reclaimable if it can produce EITHER an owning worktree or
+    # a session-child signature. With neither, it is refused outright rather than merely left
+    # unkilled: `consent_required` would still let lowfat present the user's brew service in a
+    # table and kill it on a stray selection.
+    #
+    # Verified on this machine: powerd, usbaudiod, containermanagerd and the user's Dock-launched
+    # Google Chrome are all ppid==1, and all four classified safe_kill before this guard existed.
+    if [[ -z "$owner" ]] && ! matches_specific_pattern "$win"; then
+      printf 'protected|true||%s|ppid=1 with no owning worktree and no session-child signature — launchd/daemon shape, never killed' "$session"
+      return 0
+    fi
     reason="ppid=1 (orphaned)"
     [[ -n "$owner" ]] && reason="ppid=1 (orphaned), owner: $owner"
     printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
+    return 0
+  fi
+
+  # SESSION-GRANULAR OWNERSHIP. Worktree granularity is too coarse: N Claude sessions routinely
+  # share one repo root, so "attached, and its worktree happens to be the one I am scanning from"
+  # does NOT mean the process is mine. If a live owning session exists and it is not in MY ancestor
+  # chain, the process belongs to somebody else's live session — protected, whatever the worktree
+  # says. Computing `session` and then using it only to decorate `reason` (as this did) is the
+  # documented-not-wired failure: the axis exists in the output and not in the decision.
+  if [[ -n "$session" ]] && ! in_own_tree "$session"; then
+    reason="attached to ANOTHER live claude session (pid $session)"
+    [[ -n "$owner" ]] && reason="$reason, owner: $owner"
+    printf 'protected|false|%s|%s|%s' "$owner" "$session" "$reason"
     return 0
   fi
 
@@ -1194,6 +1350,24 @@ do_delete() {
       esac
     fi
 
+    # NEVER DELETE GIT-TRACKED FILES — wired into the engine, not just written down.
+    #
+    # CLAUDE.md lists this under "Safety Rules (hardcoded, never overridden)", but it existed only
+    # as prose plus an LLM command layer reading a `tracked` boolean out of the scan JSON. Both
+    # slop lists are merged into ONE array distinguished by that flag, so a drifted or hallucinating
+    # command layer that loses the distinction hands committed work to `rm -rf` — and containment
+    # cannot catch it, because an in-root tracked file is BY CONSTRUCTION strictly under --root.
+    # Its sibling rule (F4 containment) was wired into the engine; this one was not.
+    #
+    # `scan_slop` already reports tracked slop with `tracked: true` for the user to handle via
+    # `git rm`. That is the whole delete story for tracked files; the engine refuses the rest.
+    if git -C "$root_real" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+       && git -C "$root_real" ls-files --error-unmatch -- "$real" >/dev/null 2>&1; then
+      log "BLOCKED git-tracked: $filepath"
+      failed=$((failed + 1))
+      continue
+    fi
+
     if is_safe "$filepath"; then
       log "BLOCKED safe pattern: $filepath"
       failed=$((failed + 1))
@@ -1322,6 +1496,18 @@ case "$ACTION" in
     grace_for_window "${1:-}"
     echo ""
     ;;
+  session-re)
+    # Seam: "is this command line a live-claude session shape?" — the ONE fuzzy judgment in the
+    # model, exposed so it can be pinned against REAL captured `ps -o command=` output instead of
+    # only against a fixture the harness minted for itself. The fixture route is self-fulfilling:
+    # a fake session parent named literally `claude` satisfies any plausible regex, which is
+    # exactly how a dead session axis shipped under a fully green suite.
+    #
+    # Takes the RAW ps command line and windows it internally, so this tests command_window and
+    # CRUSH_SESSION_RE composed the way production composes them.
+    win=$(command_window "${1:-}")
+    if [[ "$win" =~ $CRUSH_SESSION_RE ]]; then echo "true"; else echo "false"; fi
+    ;;
   classify)
     # Read-only introspection seam: exposes the classifier for any pid, so the kill matrix is
     # directly testable rather than only observable through a scan's pattern list.
@@ -1351,7 +1537,7 @@ case "$ACTION" in
     do_cron
     ;;
   *)
-    echo "Usage: crush.sh {scan [--global] | contention | classify <pid> | kill [--consent <pid>]... <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
+    echo "Usage: crush.sh {scan [--global] | contention | classify <pid> | session-re <cmd> | kill [--consent <pid>]... <pids...> | delete --root <path> <files...> | setup-launchagent | cron}" >&2
     exit 1
     ;;
 esac

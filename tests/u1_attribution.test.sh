@@ -17,7 +17,43 @@ wt_b=$(mk_repo "$TMPROOT/wtB")   # a sibling worktree — another live session's
 
 mcp=$(mk_exec "$TMPROOT/bin" "playwright-mcp")
 
+# ── The session regex, pinned against REAL captured command lines ─────────────────────────
+# The ONE fuzzy judgment in the model. It was previously exercised only through a fixture whose
+# session parent was an executable literally named `claude` — a shape that satisfies any plausible
+# regex. So the suite was green while the regex could not see the process that actually spawns MCP
+# servers, and every attached-process assertion below it was passing for a reason that could not
+# fail.
+#
+# These strings are verbatim `ps -o command=` output captured from live sessions on this machine.
+# The first is the one the old regex missed: `claude` followed by `/`, not by whitespace or EOL.
+# On a swarm/subagent session it is the ONLY claude process in the ancestor chain (its parent is
+# tmux), so missing it killed the session axis outright — 46 of 76 live MCP servers reported
+# owning_session:null.
+
+session_re() { crush session-re "$1" 2>/dev/null; }
+
+expect_eq "session-re: the agent version-binary path (the shape the old regex MISSED)" "true" \
+  "$(session_re '/Users/shawnroos/.local/share/claude/versions/2.1.207 --resume /x/y.jsonl --agent claude')"
+expect_eq "session-re: the version binary of a swarm subagent session" "true" \
+  "$(session_re '/Users/shawnroos/.local/share/claude/versions/2.1.207 --agent-id reviewer-r3@session-01df9627')"
+expect_eq "session-re: the pty-host wrapper" "true" \
+  "$(session_re '/Users/shawnroos/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host /tmp/x.sock')"
+expect_eq "session-re: the daemon on PATH" "true" \
+  "$(session_re '/Users/shawnroos/.local/bin/claude daemon run --json-path /x/daemon.json')"
+expect_eq "session-re: the bare argv[0] form" "true" \
+  "$(session_re 'claude bg-pty-host --bg-pty-host /tmp/x.sock')"
+
+# Negative controls. Without these the regex could be `.` and every assertion above still passes.
+expect_eq "session-re: an MCP server is NOT a session" "false" \
+  "$(session_re 'node /Users/shawnroos/.npm/_npx/9833/node_modules/.bin/playwright-mcp')"
+expect_eq "session-re: ~/.claude/<...> is a config path, NOT a session process" "false" \
+  "$(session_re '/Users/shawnroos/.claude/plugins/cache/some/bin/server --port 1')"
+expect_eq "session-re: a plain shell is NOT a session" "false" \
+  "$(session_re '/bin/bash /Users/shawnroos/bin/supervisor.sh')"
+
 # ── Liveness: the SAME pid reclassifies when its parent dies ──────────────────────────────
+# The parent here is a FOREIGN live claude session (not in crush's own ancestor chain), so the
+# child is protected regardless of worktree — see the session-granularity block below.
 
 read -r att_pid att_session <<< "$(spawn_attached "$wt_a" "$mcp")"
 
@@ -25,8 +61,6 @@ if [[ -z "$att_pid" ]]; then
   nok "liveness: could not mint an attached candidate (harness failure)"
 else
   out=$(crush_in "$wt_a" classify "$att_pid" 2>/dev/null)
-  expect_eq "liveness: a live-parent candidate in my worktree is consent_required" \
-    "consent_required" "$(json_get "$out" 'd["classification"]')"
   expect_eq "liveness: it is NOT an orphan" "false" "$(json_get "$out" 'd["orphan"]')"
   expect_eq "liveness: its owning session is the live fake claude" \
     "$att_session" "$(json_get "$out" 'd["owning_session"]')"
@@ -41,6 +75,105 @@ else
   else
     nok "liveness: candidate never reparented to ppid=1 (harness failure)"
   fi
+fi
+
+# ── The version-binary session shape is SEEN (the ADV-1 cardinal bug, end to end) ─────────
+# Same assertion as above, but the session parent is NOT named `claude` — it carries the real
+# version-binary path shape. Under the old regex this process had owning_session:null and the
+# session axis contributed nothing to its classification.
+
+read -r ver_pid ver_session <<< "$(spawn_attached_versioned "$wt_a" "$mcp")"
+
+if [[ -z "$ver_pid" ]]; then
+  nok "version-shape: could not mint the versioned-session candidate (harness failure)"
+else
+  out=$(crush_in "$wt_a" classify "$ver_pid" 2>/dev/null)
+  expect_eq "version-shape: a session named by version-binary PATH (not 'claude') is resolved" \
+    "$ver_session" "$(json_get "$out" 'd["owning_session"]')"
+  expect_eq "version-shape: and its child is protected as another session's process" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+fi
+
+# ── Session granularity beats worktree granularity ────────────────────────────────────────
+# N Claude sessions routinely share one repo root, so "attached, and its worktree IS my scan root"
+# does not make a process mine. A live owning session that is not in MY ancestor chain outranks the
+# worktree axis. Previously `session` was computed and then used ONLY to decorate `reason` — the
+# axis was in the output and not in the decision.
+
+read -r foreign_pid foreign_session <<< "$(spawn_attached "$wt_a" "$mcp")"
+
+if [[ -z "$foreign_pid" ]]; then
+  nok "session-granularity: could not mint the foreign-session candidate (harness failure)"
+else
+  out=$(crush_in "$wt_a" classify "$foreign_pid" 2>/dev/null)
+  expect_eq "session-granularity: another session's live process IN MY OWN WORKTREE is protected" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+  expect_contains "session-granularity: and it says so — protected BY SESSION, not by worktree" \
+    "$(json_get "$out" 'd["reason"]')" "ANOTHER live claude session"
+
+  # protected is refused unconditionally — the worktree matching mine must not open a consent path.
+  crush_in "$wt_a" kill --consent "$foreign_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "session-granularity: --consent CANNOT unlock another session's live process" "$foreign_pid"
+fi
+
+# ── ...but MY OWN worktree's attached, session-less process is still consent_required ──────
+# The matrix cell must survive the tightening above: an attached process with NO owning claude
+# session (a supervisor child, a shell job) in my worktree is mine to reclaim with consent.
+
+read -r plain_pid plain_parent <<< "$(spawn_attached_plain "$wt_a" "$mcp")"
+
+if [[ -z "$plain_pid" ]]; then
+  nok "own-attached: could not mint the plain-parent candidate (harness failure)"
+else
+  out=$(crush_in "$wt_a" classify "$plain_pid" 2>/dev/null)
+  expect_eq "own-attached: a live-parent, session-less candidate in my worktree is consent_required" \
+    "consent_required" "$(json_get "$out" 'd["classification"]')"
+  expect_eq "own-attached: it has no owning session" "null" "$(json_get "$out" 'd["owning_session"]')"
+fi
+
+# ── THE DAEMON GUARD: ppid==1 is necessary, never sufficient ──────────────────────────────
+# launchd-managed jobs (brew services, user LaunchAgents) and self-daemonized processes run with
+# ppid==1 for their ENTIRE LIFE — launchd is their designed parent, not the residue of a dead one.
+# Verified on this machine before the guard existed: powerd, usbaudiod, containermanagerd and the
+# user's Dock-launched Google Chrome (all ppid==1) every one classified safe_kill.
+#
+# The discriminator is the cwd: a daemon's is `/` or its install dir, never a git worktree; an
+# abandoned session child's IS the worktree it was spawned in. Both directions are asserted — a
+# guard that merely refuses everything is satisfied by deleting the feature.
+
+node_exec=$(mk_exec "$TMPROOT/bin" "node")
+
+daemon_pid=$(spawn_orphan "/" "$node_exec" --daemon-ish)
+if [[ -z "$daemon_pid" ]]; then
+  nok "daemon-guard: could not mint the daemon-shaped candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$daemon_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "safe_kill" ]]; then
+    nok "daemon-guard: THE REGRESSION — a ppid=1 node daemon with cwd=/ is safe_kill (fullcream would kill a brew service)"
+  else
+    ok "daemon-guard: a ppid=1 node daemon with cwd=/ is NOT safe_kill (got $cls)"
+  fi
+  expect_eq "daemon-guard: it is refused outright, so lowfat cannot offer it for consent either" \
+    "protected" "$cls"
+
+  # And the refusal holds at ACT time, not merely at scan time — `crush.sh kill <pid>` is reachable
+  # by the command layer with an arbitrary pid.
+  crush_in "$wt_a" kill --consent "$daemon_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "daemon-guard: --consent cannot unlock a daemon-shaped process either" "$daemon_pid"
+fi
+
+# The positive control that keeps the guard honest: the SAME generic runtime, orphaned, but sitting
+# in a real worktree — a genuinely abandoned session child — is still reclaimed.
+abandoned_pid=$(spawn_orphan "$wt_a" "$node_exec" --abandoned)
+if [[ -z "$abandoned_pid" ]]; then
+  nok "daemon-guard: could not mint the abandoned-child candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$abandoned_pid" 2>/dev/null)
+  expect_eq "daemon-guard: an orphaned node whose cwd IS a worktree is still safe_kill" \
+    "safe_kill" "$(json_get "$out" 'd["classification"]')"
 fi
 
 # ── Ownership: a SIBLING worktree's live process is NEVER killable ────────────────────────
@@ -101,7 +234,10 @@ fi
 
 gone_dir="$TMPROOT/vanishing"
 mkdir -p "$gone_dir"
-read -r gone_pid gone_session <<< "$(spawn_attached "$gone_dir" "$mcp")"
+# Plain parent, so the SESSION axis contributes nothing and the assertion isolates the thing it
+# names: an unresolvable OWNER must fail closed. With a claude-shaped parent this would classify
+# protected via the foreign-session rule and prove nothing about owner resolution.
+read -r gone_pid gone_parent <<< "$(spawn_attached_plain "$gone_dir" "$mcp")"
 rm -rf "$gone_dir"
 
 if [[ -z "$gone_pid" ]]; then
@@ -272,7 +408,9 @@ else
 fi
 
 # consent_required: refused bare, killed only with an explicit per-pid --consent.
-read -r cons_pid cons_session <<< "$(spawn_attached "$wt_a" "$mcp")"
+# Plain (session-less) parent — an attached process owned by ANOTHER live claude session is
+# protected now, and no --consent unlocks it, so it cannot carry this assertion.
+read -r cons_pid cons_parent <<< "$(spawn_attached_plain "$wt_a" "$mcp")"
 if [[ -z "$cons_pid" ]]; then
   nok "do_kill: could not mint the consent candidate (harness failure)"
 else

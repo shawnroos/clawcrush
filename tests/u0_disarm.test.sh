@@ -106,6 +106,34 @@ rc=$?
 if (( rc != 0 )); then ok "F4: flag-shaped target with no --root exits non-zero"; else nok "F4: flag-shaped target with no --root exits non-zero (got rc=0)"; fi
 expect_exists "F4: flag-shaped target survives" "$flagish"
 
+# ── "Never delete git-tracked files" — wired into the ENGINE, not just written down ───────
+# CLAUDE.md lists this under "Safety Rules (hardcoded, never overridden)", but it lived only as
+# prose plus an LLM command layer reading a `tracked` boolean out of the scan JSON. Containment
+# cannot catch this: a tracked file inside the repo is BY CONSTRUCTION strictly under --root, so
+# a drifted command layer that loses the flag hands committed work straight to `rm -rf`.
+#
+# The target is shaped like slop AND is committed — precisely the collision the rule exists for.
+
+tracked_slop="$repo_a/debug-committed.log"
+printf 'this is committed work\n' > "$tracked_slop"
+git -C "$repo_a" add -f debug-committed.log >/dev/null 2>&1
+git -C "$repo_a" commit -qm "commit a log" >/dev/null 2>&1
+age_path "$tracked_slop"
+
+out=$(crush delete --root "$repo_a" "$tracked_slop" 2>/dev/null)
+expect_eq "tracked: a git-tracked file is refused by the engine" "0" "$(json_get "$out" 'd["deleted"]')"
+expect_exists "tracked: the committed file survives" "$tracked_slop"
+expect_contains "tracked: the refusal is logged" "$(log_contents)" "BLOCKED git-tracked"
+
+# The positive control: an UNtracked file of the same shape, in the same repo, still deletes.
+# Without it, the guard above is satisfied by an engine that refuses every delete.
+untracked_slop="$repo_a/debug-untracked.log"
+printf 'real slop\n' > "$untracked_slop"
+age_path "$untracked_slop"
+out=$(crush delete --root "$repo_a" "$untracked_slop" 2>/dev/null)
+expect_eq "tracked: an untracked file of the same shape still deletes" "1" "$(json_get "$out" 'd["deleted"]')"
+expect_missing "tracked: the untracked slop is really gone" "$untracked_slop"
+
 # ── KTD6: the ~/.claude root authorizes depth-1 config backups ONLY ───────────────────────
 # Widening --root to ~/.claude must not put ~/.claude/logs or settings.json in the envelope.
 
@@ -172,5 +200,29 @@ out=$(crush_in "$repo_b" scan 2>/dev/null)
 expect_json "F7: scan output with a quote+backslash filename is valid JSON" "$out"
 expect_eq "F7: the nasty path round-trips exactly" \
   "$nasty" "$(json_get "$out" '[x["path"] for x in d["slop"] if not x["tracked"]][0]')"
+
+# ── JSON escaping survives CONTROL CHARACTERS ─────────────────────────────────────────────
+# json_escape used to pass the C0 range through raw and STRIP newlines with `tr -d`. Both are
+# corruption, not cosmetics:
+#   - one raw control char in ONE filename makes the ENTIRE scan document invalid JSON, and every
+#     command mode that parses it goes blind — including the fullcream path that is about to act
+#     on it;
+#   - a stripped newline means the emitted path is a DIFFERENT STRING than the real filename, so a
+#     delete target no longer names the file that was scanned.
+# `git ls-files -z` hands both shapes over verbatim, so neither is hypothetical.
+
+repo_c=$(mk_repo "$TMPROOT/repoC")
+ctrl=$(printf 'ctl\ttab\nnewline-debug.log')   # a real TAB and a real NEWLINE in the filename
+printf 'slop\n' > "$repo_c/$ctrl" 2>/dev/null
+
+if [[ ! -e "$repo_c/$ctrl" ]]; then
+  nok "ctrl: could not create a control-char filename (harness failure)"
+else
+  age_path "$repo_c/$ctrl"
+  out=$(crush_in "$repo_c" scan 2>/dev/null)
+  expect_json "ctrl: a filename with a tab and a newline still yields VALID scan JSON" "$out"
+  expect_eq "ctrl: and the control-char path round-trips byte-exactly (not silently rewritten)" \
+    "$ctrl" "$(json_get "$out" '[x["path"] for x in d["slop"] if not x["tracked"]][0]')"
+fi
 
 finish

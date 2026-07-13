@@ -79,6 +79,55 @@ else
   fi
 fi
 
+# ── The REAL macOS browser shape is visible — and the user's own browser is still safe ────
+# ORPHAN_RUNTIME_PATTERNS listed only lowercase `chrome`/`chromium`, and window_matches_pattern is
+# case-sensitive, so the actual macOS executables (`/Applications/Google Chrome.app/Contents/MacOS/
+# Google Chrome`) never matched — the single most common leaked-browser shape was invisible to the
+# scanner, while BROWSER_CLASS_PATTERNS right below it already used the real capitalized names.
+# The two lists disagreed about what a browser is called and the one gating KILL CANDIDACY had it
+# wrong.
+#
+# Fixing that is only safe BECAUSE of the daemon guard: a Dock-launched Google Chrome is ppid==1
+# for its entire life (verified on this machine — the user's browser, pid 95603, ppid 1, cwd
+# ~/.agent-browser). Naming it here under a bare `orphan <=> ppid==1` rule would have made the
+# user's actual browser safe_kill and fullcream would have closed it. Both halves are asserted.
+
+chrome=$(mk_exec "$TMPROOT/bin" "Google Chrome")
+
+# (a) The user's real browser: ppid==1, but its cwd is not a worktree. Must NOT be killable.
+user_chrome_pid=$(spawn_orphan "/" "$chrome" --remote-debugging-port=0)
+if [[ -z "$user_chrome_pid" ]]; then
+  nok "browser: could not mint the user's-browser candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$user_chrome_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "safe_kill" ]]; then
+    nok "browser: THE REGRESSION — the user's Dock-launched Google Chrome is safe_kill (fullcream would close their browser)"
+  else
+    ok "browser: the user's ppid=1 Google Chrome (cwd not a worktree) is NOT safe_kill (got $cls)"
+  fi
+  crush_in "$wt_a" kill --consent "$user_chrome_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "browser: and no --consent unlocks the user's browser either" "$user_chrome_pid"
+fi
+
+# (b) A leaked automation browser: orphaned, cwd IS the worktree. Must be seen AND reclaimable.
+#     Without this the fix above is satisfied by a scanner that simply cannot see browsers at all.
+leaked_chrome_pid=$(spawn_orphan "$wt_a" "$chrome" --headless)
+if [[ -z "$leaked_chrome_pid" ]]; then
+  nok "browser: could not mint the leaked-browser candidate (harness failure)"
+else
+  scan=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" scan 2>/dev/null)
+  entry=$(zombie_for "$scan" "$leaked_chrome_pid")
+  if [[ "$entry" == "null" || -z "$entry" ]]; then
+    nok "browser: a leaked orphaned 'Google Chrome' in my worktree is INVISIBLE to the scanner"
+  else
+    ok "browser: a leaked orphaned 'Google Chrome' IS detected (the real macOS executable name)"
+    expect_eq "browser: and it is reclaimable" \
+      "safe_kill" "$(json_get "$entry" 'd["classification"]')"
+  fi
+fi
+
 # ── Port squatters ────────────────────────────────────────────────────────────────────────
 
 port_entry() {

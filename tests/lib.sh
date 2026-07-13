@@ -271,14 +271,21 @@ spawn_orphan() {
   printf '%s' "$pid"
 }
 
-# spawn_attached <cwd> <exe> [args...] -> prints "<child_pid> <session_pid>"
-# The parent is an executable named `claude`, so the ancestor walk sees a live session and the
-# child classifies as attached — the exact F3 shape (a sibling session's live MCP server).
-spawn_attached() {
-  local cwd="$1"; shift
-  local sdir pf session pid="" i=0
-  sdir="$TMPROOT/session.$$.$RANDOM"
-  mkdir -p "$sdir"
+# spawn_parented <parent_rel_path> <cwd> <exe> [args...] -> prints "<child_pid> <parent_pid>"
+#
+# The generalized attached-process fixture. <parent_rel_path> is minted UNDER $TMPROOT and becomes
+# the parent's argv[0], so the caller chooses the exact command shape the ancestor walk will see.
+#
+# This parameterization is the point. The original fixture hardcoded a parent named literally
+# `claude`, which trivially satisfies ANY plausible session regex — so every attached-process
+# assertion in the suite exercised a session shape that could not fail, and the suite stayed green
+# while the session axis was dead against the real-world shape (a bare version-binary path). A
+# fixture that cannot fail is not evidence.
+spawn_parented() {
+  local prel="$1" cwd="$2"; shift 2
+  local ppath pf session pid="" i=0
+  ppath="$TMPROOT/$prel.$$.$RANDOM/$(basename "$prel")"
+  mkdir -p "$(dirname "$ppath")"
   pf=$(mktemp "$TMPROOT/pid.XXXXXX")
   {
     printf '#!/bin/bash\n'
@@ -287,10 +294,10 @@ spawn_attached() {
     printf '</dev/null >/dev/null 2>&1 &\n'
     printf 'echo $! > %q\n' "$pf"
     printf 'wait\n'
-  } > "$sdir/claude"
-  chmod +x "$sdir/claude"
+  } > "$ppath"
+  chmod +x "$ppath"
 
-  "$sdir/claude" </dev/null >/dev/null 2>&1 &
+  "$ppath" </dev/null >/dev/null 2>&1 &
   session=$!
   track_pid "$session"
 
@@ -302,4 +309,28 @@ spawn_attached() {
   done
   track_pid "$pid"
   printf '%s %s' "$pid" "$session"
+}
+
+# spawn_attached <cwd> <exe> [args...] -> prints "<child_pid> <session_pid>"
+# Parent is named `claude` — a live Claude session that is NOT ours. The child is attached and,
+# because the session is foreign, protected whatever worktree it sits in.
+spawn_attached() {
+  spawn_parented "session/claude" "$@"
+}
+
+# spawn_attached_versioned <cwd> <exe> [args...] -> prints "<child_pid> <session_pid>"
+# The REAL-WORLD session shape, and the one the old regex could not see: the agent process is a
+# bare version-binary PATH (`.../share/claude/versions/2.1.207`) with no `claude` word boundary
+# after it. On a swarm/subagent session this is the ONLY claude process in the chain — its parent
+# is tmux — so if the walk misses it, the session axis is dead. Deliberately NOT named `claude`.
+spawn_attached_versioned() {
+  spawn_parented "share/claude/versions/2.1.207" "$@"
+}
+
+# spawn_attached_plain <cwd> <exe> [args...] -> prints "<child_pid> <parent_pid>"
+# A live parent that is NOT a claude session at all (a supervisor, a shell). The child is attached
+# with NO owning session — the case where the worktree axis is all we have, and the only shape that
+# should still reach `consent_required` inside my own worktree.
+spawn_attached_plain() {
+  spawn_parented "supervisor" "$@"
 }
