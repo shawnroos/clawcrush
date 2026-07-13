@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# ClawCrush — Register zombie crusher with que-do scheduler
+# ClawCrush — Register the hourly zombie SCAN with the que-do scheduler.
+# The scheduled job is report-only: crush.sh cron logs would-kill candidates and kills nothing.
 #
 # Creates a custom script runner (not a Claude prompt task) since
 # crush.sh is a pure bash scanner that doesn't need Claude.
@@ -103,7 +104,7 @@ main() {
     return 1
   fi
 
-  # Run the cron mode (silent auto-kill)
+  # Run cron mode — REPORT-ONLY. It logs "Cron dry-run: would-kill pid ..." and kills nothing.
   bash "$crush_script" cron 2>&1
   local exit_code=$?
 
@@ -177,7 +178,7 @@ if [[ -f "$QUEUE_DIR/manifest" ]]; then
   grep -v "^${JOB_NAME}|" "$QUEUE_DIR/manifest" > "$QUEUE_DIR/manifest.tmp" 2>/dev/null || true
   mv "$QUEUE_DIR/manifest.tmp" "$QUEUE_DIR/manifest"
 fi
-echo "${JOB_NAME}|flexible|Hourly zombie process cleanup" >> "$QUEUE_DIR/manifest"
+echo "${JOB_NAME}|flexible|Hourly zombie scan (report-only, kills nothing)" >> "$QUEUE_DIR/manifest"
 
 # ── Load LaunchAgent ──────────────────────────
 
