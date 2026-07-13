@@ -23,6 +23,14 @@ done
 
 echo ""
 echo "══════════════════════════════════════"
+# A zero-discovery run must be LOUD. The whole safety contract of this engine — the kill matrix,
+# delete containment, cron's report-only-ness — is proven only by this harness, so "0 files ran"
+# and "everything is green" must never render as the same line. A wrong TESTS_DIR, a broken
+# checkout, or a rename that drops the `.test.sh` suffix would otherwise print PASSED and exit 0.
+if (( files_run == 0 )); then
+  echo "SUITE: FAILED — no test files discovered under $TESTS_DIR"
+  exit 1
+fi
 if (( files_failed > 0 )); then
   echo "SUITE: FAILED — $files_failed of $files_run file(s) failed:"
   for n in ${failed_names[@]+"${failed_names[@]}"}; do
