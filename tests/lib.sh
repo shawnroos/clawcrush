@@ -170,6 +170,43 @@ mk_exec() {
   printf '%s' "$dir/$name"
 }
 
+# mk_listener <dir> <name> — a real Mach-O that binds 127.0.0.1:<argv[1]> and then sleeps.
+# Prints its path; fails (prints nothing) when there is no compiler.
+#
+# It has to be COMPILED, not copied or aliased. lsof's COMMAND comes from the kernel's p_comm,
+# which is the executable FILE's basename: `exec -a "Some Name"` does not change it (verified —
+# lsof still reports `Python`), a symlink resolves to its target's name, and a copy of a system
+# binary is SIGKILLed on exec by code signing. Compiling is the only way to mint a process whose
+# lsof COMMAND genuinely contains spaces — i.e. Chrome's real shape (`Google Chrome`,
+# `Google Chrome for Testing`), the process that holds the CDP port the scan looks for.
+mk_listener() {
+  local dir="$1" name="$2" src
+  command -v cc >/dev/null 2>&1 || return 1
+  mkdir -p "$dir"
+  src="$dir/.listener.c"
+  cat > "$src" <<'CSRC'
+#include <stdlib.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+int main(int argc, char **argv) {
+  int port = (argc > 1) ? atoi(argv[1]) : 0;
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a;
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = htons(port);
+  if (bind(s, (struct sockaddr *)&a, sizeof a)) return 1;
+  if (listen(s, 1)) return 1;
+  for (;;) sleep(1);
+}
+CSRC
+  cc -o "$dir/$name" "$src" 2>/dev/null || return 1
+  printf '%s' "$dir/$name"
+}
+
 track_pid() {
   [[ -n "${1:-}" && -n "$PIDFILE" ]] && printf '%s\n' "$1" >> "$PIDFILE"
   return 0

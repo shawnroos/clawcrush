@@ -285,6 +285,39 @@ command_window() {
   printf '%s' "$out"
 }
 
+# Does the command window contain PATTERN as a whole command/path COMPONENT?
+#
+# SINGLE source of truth for every pattern -> KILL-CANDIDACY decision (zombie_rows, both its
+# pattern lists, and scan_contention). Bare substring matching inside the window is a
+# kill-candidacy bug, not a cosmetic one: an orphaned `/bin/bash /tmp/invitee-app/start.sh` — a
+# path that merely CONTAINS the letters of `vite` — matched the DEV pattern and classified
+# safe_kill, which fullcream then kills with no human in the loop. That is the same defect class
+# as F7 ("the command line merely contains playwright-mcp"), one level in: F7 windowed the match
+# to the command HEAD, but within the head it was still a substring.
+#
+# A boundary here is any character that cannot be part of an identifier: [^[:alnum:]_-]. Slashes,
+# spaces, dots, '@' and ':' all qualify, so real invocations still hit —
+#   /x/node_modules/vite/bin/vite.js   ✓ vite
+#   npx chrome-devtools-mcp@latest     ✓ chrome-devtools-mcp
+#   /x/.bin/ng serve                   ✓ ng serve
+#   /Applications/…/Google Chrome for Testing   ✓ Google Chrome for Testing
+# while a word that merely contains the pattern does not —
+#   /tmp/invitee-app/start.sh          ✗ vite      (preceded by 'n')
+#   /x/bin/vitest                      ✗ vite      (followed by 't')
+#   /x/runner /tmp/invite_tool.py      ✗ vite
+#
+# `-` and `_` are deliberately identifier chars, NOT boundaries. Without that, `node` would match
+# `node_modules` in essentially every JS command line on the machine, and `chrome` would match
+# `chrome-devtools-mcp`. This is why the boundary class is not simply [^[:alnum:]].
+#
+# The pattern is QUOTED inside the =~, so bash 3.2 treats it as a literal string: patterns may
+# contain regex metacharacters and spaces without any escaping.
+window_matches_pattern() {
+  local win="$1" p="$2"
+  [[ -n "$p" ]] || return 1
+  [[ "$win" =~ (^|[^[:alnum:]_-])"$p"([^[:alnum:]_-]|$) ]]
+}
+
 pid_command() {
   local line
   line=$(ps -o command= -p "$1" 2>/dev/null) || return 1
@@ -316,6 +349,10 @@ in_own_tree() {
   [[ "$OWN_ANCESTORS" == *" $1 "* ]]
 }
 
+# Deliberately a bare SUBSTRING match, unlike window_matches_pattern. The boundary rule exists to
+# stop a loose match from widening the KILL surface; here a loose match only ever widens the
+# PROTECT surface. Over-matching costs a missed reclaim; under-matching corrupts a node_modules
+# mid-install. Narrowing this to word boundaries would be a safety regression, not a cleanup.
 matches_never_kill() {
   local window="$1" pat
   for pat in "${NEVER_KILL_PATTERNS[@]}"; do
@@ -473,7 +510,7 @@ zombie_rows() {
     local name="" pattern=""
 
     for p in ${patterns[@]+"${patterns[@]}"}; do
-      if [[ "$win" == *"$p"* ]]; then
+      if window_matches_pattern "$win" "$p"; then
         pattern="$p"
         name="${p#mcp-}"
         name="${name%% *}"
@@ -486,7 +523,7 @@ zombie_rows() {
       # process on the machine. They stay gated on orphan AND age.
       [[ "$ppid" != "1" ]] && continue
       for p in "${ORPHAN_RUNTIME_PATTERNS[@]}"; do
-        if [[ "$win" =~ (^|[/[:space:]])"$p"([[:space:]]|$) ]]; then
+        if window_matches_pattern "$win" "$p"; then
           pattern="$p (orphaned)"
           name="$p"
           break
@@ -549,16 +586,37 @@ port_in_range() {
   return 1
 }
 
+# lsof listeners, read from -F FIELD output rather than scraped columns.
+#
+# The columnar form is a display format, not an interface: COMMAND is a fixed 9-wide left column
+# holding a name that can contain spaces (`Google Chrome`, `Google Chrome for Testing` — both are
+# real listeners, and Chrome is the process holding the CDP port 9222 this scan exists to find).
+# Any parse keyed on positional fields ($2 for pid, $9 for the address) is one lsof rendering
+# quirk away from reading a command FRAGMENT as a pid and silently dropping the listener.
+#
+# -F emits one field per line, tagged: `p<pid>` opens a process record, `n<addr>` is a file's
+# name. No columns, no widths, no truncation, no escaping to undo.
 scan_ports() {
   local scan_root="${1:-}"
   local json_items=()
   local seen=" "
-  local pid addr port
+  local line pid="" addr port
 
-  while read -r pid addr; do
-    [[ -z "${pid:-}" || -z "${addr:-}" ]] && continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+  while IFS= read -r line; do
+    case "$line" in
+      p*)
+        pid="${line#p}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || pid=""
+        continue
+        ;;
+      n*) addr="${line#n}" ;;
+      *) continue ;;   # f<fd> and any other field: not needed
+    esac
+
+    [[ -n "$pid" ]] || continue
     [[ "$pid" == "$$" ]] && continue
+    [[ -n "$addr" ]] || continue
+    # host:port for every LISTEN shape lsof emits — 127.0.0.1:4200, *:9222, [::1]:4200.
     port="${addr##*:}"
     [[ "$port" =~ ^[0-9]+$ ]] || continue
     port_in_range "$port" || continue
@@ -576,7 +634,7 @@ scan_ports() {
     [[ -n "$owner" ]] && owner_json="\"$(json_escape "$owner")\""
 
     json_items+=("{\"port\":$port,\"pid\":$pid,\"command\":\"$(json_escape "$win")\",\"orphan\":$orphan,\"owner_worktree\":$owner_json,\"classification\":\"$classification\",\"reason\":\"$(json_escape "$reason")\"}")
-  done < <(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $2, $9}')
+  done < <(lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null)
 
   json_array ${json_items[@]+"${json_items[@]}"}
 }
@@ -871,7 +929,7 @@ scan_contention() {
     win=$(command_window "$cmd")
     hit=""
     for p in ${contend_patterns[@]+"${contend_patterns[@]}"}; do
-      if [[ "$win" == *"$p"* ]]; then hit="$p"; break; fi
+      if window_matches_pattern "$win" "$p"; then hit="$p"; break; fi
     done
     [[ -z "$hit" ]] && continue
 
@@ -901,11 +959,19 @@ scan_contention() {
     done <<< "$owners"
   fi
 
-  # Karma's default port range: more than one listener there is a clash.
+  # Karma's default port range: more than one listener there is a clash. Counted from -F field
+  # output for the same reason scan_ports uses it — never scrape lsof's display columns.
   local karma_clashes
-  karma_clashes=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
-    | awk 'NR>1 {n=$9; sub(/.*:/, "", n); if (n+0 >= 9876 && n+0 <= 9885) print $2}' \
-    | sort -u | wc -l | tr -d ' ')
+  karma_clashes=$(lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>/dev/null \
+    | awk '
+        /^p/ { pid = substr($0, 2); next }
+        /^n/ {
+          if (pid == "") next
+          addr = substr($0, 2)
+          sub(/.*:/, "", addr)
+          if (addr + 0 >= 9876 && addr + 0 <= 9885 && !(pid in seen)) { seen[pid] = 1; n++ }
+        }
+        END { print n + 0 }')
   [[ "$karma_clashes" =~ ^[0-9]+$ ]] || karma_clashes=0
   if (( karma_clashes > 0 )); then karma_clashes=$(( karma_clashes - 1 )); fi
 

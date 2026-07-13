@@ -168,6 +168,57 @@ else
     "null" "$(zombie_for "$scan" "$tail_pid")"
 fi
 
+# ── Boundaried matching: a WORD is not a command either ───────────────────────────────────
+# Windowing the match to the command head is necessary but not sufficient: within the head the
+# match was still a bare substring, so any path whose letters happened to CONTAIN a pattern
+# matched it. Verified against the pre-fix engine: an orphaned `/bin/bash …/invitee-app/start.sh`
+# came back pattern="vite", classification="safe_kill" — which fullcream then kills autonomously,
+# with no human in the loop. Same defect class as the `tail -f` case above, one level in.
+#
+# Both directions are asserted. A test that only proves "not flagged" is satisfied by a pattern
+# list that matches nothing at all, so the positive control has to sit next to it.
+
+boundary_dir_exec=$(mk_exec "$TMPROOT/invitee-app" "start.sh")   # path CONTAINS 'vite'
+boundary_dir_pid=$(spawn_orphan "$wt_a" "$boundary_dir_exec")
+
+if [[ -z "$boundary_dir_pid" ]]; then
+  nok "boundary: could not mint the invitee-app candidate (harness failure)"
+else
+  scan=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" scan 2>/dev/null)
+  expect_eq "boundary: an orphan whose PATH merely contains 'vite' (invitee-app) is NOT flagged" \
+    "null" "$(zombie_for "$scan" "$boundary_dir_pid")"
+fi
+
+# The same class in argument position: `runner …/invite_tool.py`.
+runner_exec=$(mk_exec "$TMPROOT/bin" "runner")
+boundary_arg_pid=$(spawn_orphan "$wt_a" "$runner_exec" "$TMPROOT/invite_tool.py")
+
+if [[ -z "$boundary_arg_pid" ]]; then
+  nok "boundary: could not mint the invite_tool candidate (harness failure)"
+else
+  scan=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" scan 2>/dev/null)
+  expect_eq "boundary: an orphan whose ARGUMENT merely contains 'vite' (invite_tool.py) is NOT flagged" \
+    "null" "$(zombie_for "$scan" "$boundary_arg_pid")"
+fi
+
+# Positive control: the real thing still matches. Without this, the two assertions above pass
+# trivially if pattern matching breaks entirely.
+vite_exec=$(mk_exec "$TMPROOT/bin" "vite")
+vite_pid=$(spawn_orphan "$wt_a" "$vite_exec")
+
+if [[ -z "$vite_pid" ]]; then
+  nok "boundary: could not mint the real vite candidate (harness failure)"
+else
+  scan=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" scan 2>/dev/null)
+  entry=$(zombie_for "$scan" "$vite_pid")
+  if [[ "$entry" == "null" || -z "$entry" ]]; then
+    nok "boundary: an orphan ACTUALLY named vite is no longer detected (the fix over-tightened)"
+  else
+    expect_eq "boundary: an orphan actually named vite IS still matched on 'vite'" \
+      "vite" "$(json_get "$entry" 'd["pattern"]')"
+  fi
+fi
+
 # ── do_kill: input validation ─────────────────────────────────────────────────────────────
 
 crush kill abc >/dev/null 2>&1

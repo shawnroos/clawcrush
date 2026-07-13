@@ -125,6 +125,34 @@ else
   fi
 fi
 
+# ── A listener whose COMMAND contains SPACES ──────────────────────────────────────────────
+# Chrome's executables are literally named `Google Chrome` / `Google Chrome for Testing`, and
+# Chrome is the process that holds the CDP port (9222) the port scan exists to find. lsof's
+# columnar output is a DISPLAY format — a fixed-width COMMAND column carrying a name with spaces
+# in it — so any parse keyed on positional fields ($2 for the pid, $9 for the address) is one
+# rendering quirk away from reading a command fragment as a pid and dropping the listener on the
+# floor. scan_ports reads -F field output (`p<pid>` / `n<addr>`, one field per line) instead.
+# This pins that: the port scan must see Chrome's real command shape.
+
+spaced_exec=$(mk_listener "$TMPROOT/bin" "Google Chrome for Testing") || spaced_exec=""
+
+if [[ -z "$spaced_exec" ]]; then
+  nok "ports(spaced): could not compile the spaced-name listener (harness failure — needs cc)"
+else
+  spaced_pid=$(spawn_orphan "$wt_a" "$spaced_exec" 4289)
+  sleep 1
+  scan=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" scan 2>/dev/null)
+  entry=$(port_entry "$scan" "$spaced_pid")
+  if [[ "$entry" == "null" || -z "$entry" ]]; then
+    nok "ports(spaced): a listener whose command name contains spaces is invisible to the port scan"
+  else
+    expect_eq "ports(spaced): a spaced-command listener (Chrome's real shape) IS detected" \
+      "4289" "$(json_get "$entry" 'd["port"]')"
+    expect_eq "ports(spaced): and it is classified, not silently dropped" \
+      "safe_kill" "$(json_get "$entry" 'd["classification"]')"
+  fi
+fi
+
 # ── Grace selection seam ──────────────────────────────────────────────────────────────────
 
 expect_eq "grace: a ChromeHeadless-class process gets the short grace" \
