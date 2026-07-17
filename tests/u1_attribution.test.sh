@@ -112,7 +112,7 @@ else
     "$(json_get "$out" 'd["reason"]')" "ANOTHER live claude session"
 
   # protected is refused unconditionally — the worktree matching mine must not open a consent path.
-  crush_in "$wt_a" kill --consent "$foreign_pid" >/dev/null 2>&1
+  expect_refused_kill "session-granularity: --consent cannot unlock another session's process" "$wt_a" "$foreign_pid"
   sleep 1
   expect_alive "session-granularity: --consent CANNOT unlock another session's live process" "$foreign_pid"
 fi
@@ -160,7 +160,7 @@ else
 
   # And the refusal holds at ACT time, not merely at scan time — `crush.sh kill <pid>` is reachable
   # by the command layer with an arbitrary pid.
-  crush_in "$wt_a" kill --consent "$daemon_pid" >/dev/null 2>&1
+  expect_refused_kill "daemon-guard: --consent cannot unlock a daemon-shaped process" "$wt_a" "$daemon_pid"
   sleep 1
   expect_alive "daemon-guard: --consent cannot unlock a daemon-shaped process either" "$daemon_pid"
 fi
@@ -214,7 +214,7 @@ else
     "protected" "$cls"
 
   # protected must hold at ACT time too — and --consent must not unlock it.
-  crush_in "$wt_a" kill --consent "$selfd_pid" >/dev/null 2>&1
+  expect_refused_kill "abandonment-signal: --consent cannot unlock it" "$wt_a" "$selfd_pid"
   sleep 1
   expect_alive "abandonment-signal: --consent cannot unlock it either" "$selfd_pid"
 
@@ -265,7 +265,7 @@ else
   expect_eq "session-host: putting tmux in the scan's pattern list makes it VISIBLE, never killable" \
     "protected" "$(json_get "$out" 'd["classification"]')"
 
-  crush_in "$wt_a" kill --consent "$tmux_pid" >/dev/null 2>&1
+  expect_refused_kill "session-host: --consent cannot unlock a tmux server" "$wt_a" "$tmux_pid"
   sleep 1
   expect_alive "session-host: --consent cannot unlock a session host either" "$tmux_pid"
 fi
@@ -352,7 +352,7 @@ else
   expect_eq "self-session: 'claude daemon run' in a worktree is protected (was safe_kill)" \
     "protected" "$(json_get "$out" 'd["classification"]')"
 
-  crush_in "$wt_a" kill --consent "$daemon_run_pid" >/dev/null 2>&1
+  expect_refused_kill "self-session: --consent cannot unlock the claude daemon" "$wt_a" "$daemon_run_pid"
   sleep 1
   expect_alive "self-session: --consent cannot unlock the claude daemon" "$daemon_run_pid"
 fi

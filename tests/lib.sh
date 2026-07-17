@@ -120,6 +120,23 @@ expect_dead() {
   if kill -0 "$pid" 2>/dev/null; then nok "$desc (pid $pid is still alive)"; else ok "$desc"; fi
 }
 
+# expect_refused_kill <desc> <cwd> <pid...> — run `kill --consent <pid>` and assert the engine
+# REFUSED it, positively.
+#
+# `crush … kill --consent "$p" >/dev/null 2>&1; expect_alive …` is NOT this assertion. It discards
+# both output and status, so it is equally satisfied by the engine refusing (what we mean) and by
+# the kill never running at all — a parse error, a bad flag, an argv change. The most
+# safety-critical rule in the model ("no flag unlocks protected") would then be green on the wrong
+# error path, which has already happened once on this branch. Assert the verdict, then survival.
+expect_refused_kill() {
+  local desc="$1" cwd="$2"; shift 2
+  local out
+  out=$(crush_in "$cwd" kill --consent "$@" 2>/dev/null) || true
+  expect_json "$desc — kill emits valid JSON (proves it ran)" "$out"
+  expect_eq "$desc" "1" "$(json_get "$out" 'd["refused"]')"
+  expect_eq "$desc — and nothing was killed" "0" "$(json_get "$out" 'd["killed"]')"
+}
+
 expect_exists() {
   local desc="$1" path="$2"
   if [[ -e "$path" ]]; then ok "$desc"; else nok "$desc (missing $path)"; fi

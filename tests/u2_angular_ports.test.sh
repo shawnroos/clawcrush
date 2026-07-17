@@ -106,7 +106,7 @@ else
   else
     ok "browser: the user's ppid=1 Google Chrome (cwd not a worktree) is NOT safe_kill (got $cls)"
   fi
-  crush_in "$wt_a" kill --consent "$user_chrome_pid" >/dev/null 2>&1
+  expect_refused_kill "browser: --consent cannot unlock the user's browser" "$wt_a" "$user_chrome_pid"
   sleep 1
   expect_alive "browser: and no --consent unlocks the user's browser either" "$user_chrome_pid"
 fi
@@ -329,7 +329,7 @@ else
   fi
   expect_eq "veto: it is protected, not merely consent_required" "protected" "$cls"
 
-  crush_in "$wt_a" kill --consent "$serving_pid" >/dev/null 2>&1
+  expect_refused_kill "veto: --consent cannot unlock a serving dev server" "$wt_a" "$serving_pid"
   sleep 1
   expect_alive "veto: --consent cannot unlock a serving dev server either" "$serving_pid"
 fi
