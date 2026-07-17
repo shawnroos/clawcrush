@@ -17,8 +17,10 @@
 # CRON IS REPORT-ONLY. It kills nothing. Every line it emits is prefixed `Cron dry-run:`.
 #
 # SAFETY MODEL — age is never sufficient to call a process a zombie. Two axes decide:
-#   liveness  — ppid == 1 AND (an owning worktree OR a session-child signature). ppid==1 alone is
-#               NOT orphanhood: launchd-managed jobs are ppid==1 for their entire life.
+#   liveness  — ppid == 1 AND NOT a daemon. ppid==1 alone is NOT orphanhood: launchd-managed jobs
+#               and self-daemonizing session hosts (tmux, screen, pm2) are ppid==1 for their whole
+#               life. Daemonhood is decided by POSITIVE signals (launchctl membership, a session-
+#               host name, a live-claude command shape) — never by inferring it from the cwd.
 #   ownership — owning worktree (lsof cwd -> git toplevel) AND owning claude session. A live
 #               session that is not MINE outranks the worktree — sessions share repo roots.
 #
@@ -30,8 +32,10 @@
 #   owner unknown        | see below              | consent_required (fail closed)
 #
 # "owner unknown + orphan" splits on the session-child signature:
-#   named MCP server / dev-stack process -> safe_kill (its session is provably gone)
-#   generic runtime, no worktree          -> protected (launchd/daemon shape; never killed)
+#   named MCP server / dev-stack process  -> safe_kill (its session is provably gone)
+#   cwd was resolved but has been DELETED -> safe_kill (the worktree it lived in is gone)
+#   generic runtime, cwd exists, no owner -> protected (launchd/daemon shape; never killed)
+#   cwd unreadable at all                 -> protected (fail closed)
 #
 # `protected` is refused unconditionally — no flag, including --consent, unlocks it.
 
@@ -160,6 +164,36 @@ NEVER_KILL_PATTERNS=(
   "tsserver"
   "typescript-language-server"
   "language-server"
+)
+
+# SESSION HOSTS — process supervisors that HOST other people's live work. Refused unconditionally,
+# exactly like NEVER_KILL_PATTERNS, and for a stronger reason: killing one takes down every session
+# inside it.
+#
+# These exist because ppid==1 is a LIFECYCLE fact, not an abandonment fact, and the previous
+# discriminator ("a daemon's cwd is never a git worktree") is simply false for this class. Verified
+# live on this machine: the claude-swarm tmux servers (`tmux -L claude-swarm-… new-session …`) are
+# ppid==1 for their entire life — tmux daemonizes by design, so launchd is their INTENDED parent —
+# and their cwd resolves to the worktree the swarm was launched from. That satisfied
+# `orphan && owner != ""`, so classify_pid returned safe_kill and `crush.sh kill <pid>` would have
+# SIGTERMed a tmux server with live Claude sessions inside it.
+#
+# Membership is by NAME, checked on the command window, and it short-circuits BEFORE any cwd is
+# consulted. That is the point: cwd is not a sound liveness discriminator, so the fix cannot be
+# another cwd rule. `screen`, `pm2` and `sshd` are the same shape (self-daemonizing supervisors of
+# other people's sessions); `launchd` itself is here so pid 1 can never be named.
+#
+# CRUSH_EXTRA_PATTERNS cannot unlock these — the denylist is checked before the pattern lists, so
+# putting `tmux` in the scan's pattern list makes it VISIBLE, never killable.
+SESSION_HOST_PATTERNS=(
+  "tmux"
+  "tmux-server"
+  "screen"
+  "zellij"
+  "sshd"
+  "pm2"
+  "PM2"
+  "launchd"
 )
 
 SLOP_EXTENSIONS=("log" "bak" "orig" "backup")
@@ -452,6 +486,45 @@ matches_never_kill() {
   return 1
 }
 
+# Is this command window a SESSION HOST (tmux/screen/pm2/sshd/launchd)? Boundary-matched, so
+# `tmux` hits `/opt/homebrew/bin/tmux -L …` and `screen` does not hit `screencapture`. Widening
+# this only ever widens the PROTECT surface, so it is the safe direction to err in.
+matches_session_host() {
+  local win="$1" p
+  for p in "${SESSION_HOST_PATTERNS[@]}"; do
+    if window_matches_pattern "$win" "$p"; then return 0; fi
+  done
+  return 1
+}
+
+# LAUNCHD MEMBERSHIP — the positive signal the old daemon guard was trying to INFER from the cwd.
+#
+# `launchctl list` prints `PID<TAB>Status<TAB>Label` for every job launchd manages in this user's
+# domain — brew services, user LaunchAgents, login items. A pid in that list has launchd as its
+# LIVE, MANAGING parent; its ppid==1 is its steady state, not the residue of a dead session. That
+# is precisely the property the guard needs, read directly instead of guessed.
+#
+# (`launchctl procinfo <pid>` would be the more direct query but it requires root, so it is
+# unusable from a user-context LaunchAgent — which is the exact context that matters here.)
+#
+# Computed ONCE, EAGERLY, at load — deliberately not lazily inside is_launchd_managed. classify_pid
+# runs inside a `$( )` command substitution (zombie_rows, scan_ports, do_kill all call it that way),
+# so a lazy cache would live in a subshell and die with it: launchctl would be re-forked for EVERY
+# candidate on a box whose defining condition is that it is already contended. Same reason
+# OWN_ANCESTORS is computed here. ~60ms, once.
+#
+# Failure (no launchctl, empty domain, Linux) leaves the set empty — the session-host denylist and
+# the daemon guard still stand behind it.
+LAUNCHD_PIDS=""
+compute_launchd_pids() {
+  LAUNCHD_PIDS=" $(launchctl list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ { printf "%s ", $1 }' 2>/dev/null || true)"
+}
+compute_launchd_pids
+
+is_launchd_managed() {
+  [[ "$LAUNCHD_PIDS" == *" $1 "* ]]
+}
+
 # Does this window carry a SESSION-CHILD signature — a named MCP server, or a dev-stack process?
 #
 # This is the discriminator the daemon guard in classify_pid turns on. A named MCP server or an
@@ -518,13 +591,42 @@ owning_session_of() {
   return 1
 }
 
+# A process's cwd, and — critically — WHICH KIND of failure we got when it does not resolve.
+#
+# The old code collapsed three distinct states into one "owner unknown", and that conflation is
+# what made the daemon guard both over- and under-shoot:
+#
+#   ok      — lsof gave a path and it EXISTS. Ownership is knowable.
+#   gone    — lsof gave a path and it NO LONGER EXISTS on disk. That is ABANDONMENT evidence, not
+#             daemon evidence: a daemon's cwd is `/` or its install dir and those do not get
+#             deleted, whereas an MCP server whose worktree was removed by `wtc` after a PR merged
+#             is left holding a dangling cwd. That is the single most common leak shape on this
+#             machine, and the old guard classified it `protected` — permanently unkillable, the
+#             exact target clawcrush exists to reclaim, made invisible by a safety-looking rule.
+#   unknown — lsof gave nothing at all (permissions, a race, no lsof). Fail closed.
+#
+# (Verified on macOS: for a deleted cwd, lsof still prints the original path verbatim with no
+# marker, so `-d` on the returned path is what separates `gone` from `ok`.)
+_CWD_PATH=""
+_CWD_STATE="unknown"
+set_pid_cwd() {
+  local cwd
+  _CWD_PATH=""
+  _CWD_STATE="unknown"
+  cwd=$(lsof -a -p "$1" -d cwd -Fn 2>/dev/null | grep '^n' | head -1 | sed 's/^n//') || cwd=""
+  [[ -n "$cwd" ]] || return 1
+  _CWD_PATH="$cwd"
+  if [[ -d "$cwd" ]]; then _CWD_STATE="ok"; else _CWD_STATE="gone"; fi
+  return 0
+}
+
 # The worktree that owns a process, via its cwd. Fails when unresolvable — and unresolvable
 # always means "fail closed", never "assume mine".
 owner_worktree_of() {
-  local cwd top
-  cwd=$(lsof -a -p "$1" -d cwd -Fn 2>/dev/null | grep '^n' | head -1 | sed 's/^n//') || return 1
-  [[ -n "$cwd" && -d "$cwd" ]] || return 1
-  top=$(worktree_of "$cwd") || return 1
+  local top
+  set_pid_cwd "$1" || return 1
+  [[ "$_CWD_STATE" == "ok" ]] || return 1
+  top=$(worktree_of "$_CWD_PATH") || return 1
   printf '%s' "$top"
 }
 
@@ -562,10 +664,41 @@ classify_pid() {
     return 0
   fi
 
+  # SESSION HOSTS. A tmux/screen/pm2/sshd server hosts other people's live work, and it is ppid==1
+  # for its entire life BY DESIGN. Refused unconditionally, before any cwd is consulted — because
+  # cwd is exactly the signal that gets this class wrong (the claude-swarm tmux servers on this
+  # machine have a cwd that IS a git worktree, which made them safe_kill).
+  if matches_session_host "$win"; then
+    printf 'protected|false|||session host (tmux/screen/pm2/sshd) — hosts live sessions, never killed'
+    return 0
+  fi
+
+  # THE SUBJECT PID IS ITSELF A LIVE CLAUDE SESSION OR THE DAEMON.
+  #
+  # CRUSH_SESSION_RE was applied only to ANCESTORS (owning_session_of starts at the PARENT), so the
+  # model had no rule at all about a process that IS a session. `claude daemon run` classified
+  # protected only INCIDENTALLY, because its cwd happens not to resolve to a git repo — change that
+  # accident (a session or daemon whose cwd is a worktree) and the process at the top of the session
+  # tree came back safe_kill. The one signal that identifies these processes was never consulted
+  # about the subject.
+  #
+  # Over-matching here is safe by the same argument the regex already makes for itself: a spurious
+  # session hit only ever moves a process toward `protected`.
+  if [[ "$win" =~ $CRUSH_SESSION_RE ]]; then
+    printf 'protected|false|||is itself a live claude session/daemon — never killed'
+    return 0
+  fi
+
   ppid=$(pid_ppid "$pid" 2>/dev/null) || ppid=""
   if [[ "$ppid" == "1" ]]; then orphan="true"; else orphan="false"; fi
 
-  owner=$(owner_worktree_of "$pid" 2>/dev/null) || owner=""
+  # NOT in a subshell: classify_pid needs _CWD_STATE, and $( ) would discard it.
+  set_pid_cwd "$pid" 2>/dev/null || true
+  owner=""
+  if [[ "$_CWD_STATE" == "ok" ]]; then
+    owner=$(worktree_of "$_CWD_PATH" 2>/dev/null) || owner=""
+  fi
+  local cwd_state="$_CWD_STATE"
   session=$(owning_session_of "$pid" 2>/dev/null) || session=""
 
   if [[ "$orphan" == "true" ]]; then
@@ -577,22 +710,49 @@ classify_pid() {
     # abandoned one, and it is the SAME defect shape as F1: a signal that is a pure function of
     # process lifecycle rather than of abandonment.
     #
-    # The discriminator is the cwd. An abandoned session child still sits in the worktree it was
-    # spawned in; a daemon's cwd is `/`, its own install dir, or unreadable — never a git worktree.
-    # So an orphan is only autonomously reclaimable if it can produce EITHER an owning worktree or
-    # a session-child signature. With neither, it is refused outright rather than merely left
-    # unkilled: `consent_required` would still let lowfat present the user's brew service in a
-    # table and kill it on a stray selection.
+    # The guard used to infer daemonhood from the cwd ("a daemon's cwd is never a git worktree").
+    # That discriminator is FALSE — verified live on the tmux servers hosting this machine's Claude
+    # swarm sessions — and it was unsound in BOTH directions:
+    #   false positive: a daemon whose cwd IS a worktree (tmux, a nohup'd server)   -> safe_kill
+    #   false negative: an abandoned MCP server whose worktree was DELETED          -> protected
+    # So daemonhood is now decided by POSITIVE signals only, and the cwd is used for what it can
+    # actually testify to — ownership, and whether the directory still exists.
     #
     # Verified on this machine: powerd, usbaudiod, containermanagerd and the user's Dock-launched
     # Google Chrome are all ppid==1, and all four classified safe_kill before this guard existed.
-    if [[ -z "$owner" ]] && ! matches_specific_pattern "$win"; then
-      printf 'protected|true||%s|ppid=1 with no owning worktree and no session-child signature — launchd/daemon shape, never killed' "$session"
+
+    # (1) launchd MANAGES this pid. The positive form of the signal the cwd rule was guessing at.
+    if is_launchd_managed "$pid"; then
+      printf 'protected|true|%s|%s|launchd-managed job (launchctl list) — ppid=1 is its steady state, never killed' "$owner" "$session"
       return 0
     fi
-    reason="ppid=1 (orphaned)"
-    [[ -n "$owner" ]] && reason="ppid=1 (orphaned), owner: $owner"
-    printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
+
+    # (2) A session-child signature (named MCP server, dev-stack process) — its session is provably
+    #     gone, so ppid==1 really is abandonment.
+    # (3) Its cwd was RESOLVED and has since been DELETED — the worktree it was spawned in is gone.
+    #     This is the `wtc`-after-merge leak, and the old guard hid it.
+    # (4) It has a resolvable owning worktree — an abandoned child still sitting in its worktree.
+    if matches_specific_pattern "$win"; then
+      reason="ppid=1 (orphaned), session-child signature"
+      [[ -n "$owner" ]] && reason="ppid=1 (orphaned), owner: $owner"
+      printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
+      return 0
+    fi
+    if [[ "$cwd_state" == "gone" ]]; then
+      printf 'safe_kill|true||%s|ppid=1 (orphaned), its cwd (%s) has been deleted — abandoned' \
+        "$session" "$_CWD_PATH"
+      return 0
+    fi
+    if [[ -n "$owner" ]]; then
+      printf 'safe_kill|true|%s|%s|ppid=1 (orphaned), owner: %s' "$owner" "$session" "$owner"
+      return 0
+    fi
+
+    # Neither a session-child signature, nor a deleted cwd, nor an owning worktree: a live cwd that
+    # is not a repo (a daemon's `/` or install dir), or an unreadable one. Refused outright rather
+    # than merely left unkilled — `consent_required` would still let lowfat put the user's brew
+    # service in a table and kill it on a stray selection.
+    printf 'protected|true||%s|ppid=1 with no session-child signature, no owning worktree and a live cwd — launchd/daemon shape, never killed' "$session"
     return 0
   fi
 
@@ -1295,13 +1455,36 @@ do_delete() {
     return 2
   fi
 
-  # ~/.claude is authorized ONLY for depth-1 config backups (KTD6). It must never become a
-  # recursive delete license over ~/.claude/logs, settings.json, or projects/.
-  local backup_only="false"
-  local claude_real
+  # ~/.claude IS NOT A DELETE ROOT. Exactly two shapes under it are authorized, each with its own
+  # content guard, and every other root under ~/.claude is refused outright.
+  #
+  #   mode=backup_only   --root ~/.claude            -> depth-1 *.bak / *.backup* ONLY (KTD6)
+  #   mode=projects_only --root ~/.claude/projects   -> depth-1 dirs that the ENGINE re-derives as
+  #                                                     orphaned refs (see below)
+  #   (anything else under ~/.claude)                -> refused: unauthorized root
+  #
+  # `backup_only` keyed on exact string equality with ~/.claude, so passing the PROJECTS SUBDIR as
+  # the root walked straight past the KTD6 restriction this block promises — and scan_global emits
+  # `~/.claude/projects` as a root, and commands/crush-fullcream.md names it explicitly, so that is
+  # a first-class path, not a hypothetical. Verified in a sandboxed HOME: a project dir whose newest
+  # session JSONL points at a LIVE cwd — one scan_global correctly reports as NOT orphaned — was
+  # still rm -rf'd. That is the same "documented, not wired" shape as the git-tracked rule below,
+  # with a worse blast radius: a committed file is recoverable from git, a conversation transcript
+  # is not. (F5 — 138/145 live project dirs offered for deletion — is the scan-side regression this
+  # backstop has to survive.)
+  local mode="repo"
+  local claude_real projects_real
   claude_real=$(canonical_path "$HOME/.claude" 2>/dev/null) || claude_real=""
+  projects_real=$(canonical_path "$HOME/.claude/projects" 2>/dev/null) || projects_real=""
+
   if [[ -n "$claude_real" && "$root_real" == "$claude_real" ]]; then
-    backup_only="true"
+    mode="backup_only"
+  elif [[ -n "$projects_real" && "$root_real" == "$projects_real" ]]; then
+    mode="projects_only"
+  elif [[ -n "$claude_real" && "$root_real" == "$claude_real"/* ]]; then
+    log "BLOCKED unauthorized root under ~/.claude: $root_real"
+    echo "{\"deleted\":0,\"failed\":0,\"bytes_freed\":0,\"freed_fmt\":\"0B\",\"error\":\"unauthorized root under ~/.claude\"}" >&2
+    return 2
   fi
 
   local deleted=0 failed=0 bytes_freed=0
@@ -1331,7 +1514,7 @@ do_delete() {
       continue
     fi
 
-    if [[ "$backup_only" == "true" ]]; then
+    if [[ "$mode" == "backup_only" ]]; then
       local parent base
       parent=$(dirname "$real")
       base=$(basename "$real")
@@ -1348,6 +1531,41 @@ do_delete() {
           continue
           ;;
       esac
+    fi
+
+    if [[ "$mode" == "projects_only" ]]; then
+      # The engine RE-DERIVES the orphaned predicate for this exact target. Containment is not
+      # enough here: an in-root project dir is by construction strictly under --root, so the only
+      # thing standing between a live conversation transcript and `rm -rf` is that the engine
+      # itself agrees the ref is dead. Nothing else ties a delete target under this root to what
+      # scan_global actually reported.
+      #
+      # Same predicate scan_global uses (resolve_project_cwd + "that path is gone"), so the two can
+      # never drift. FAIL CLOSED: no parseable cwd -> refuse. The dash-encoded directory NAME is
+      # never trusted — it is not invertible, and trusting it is exactly F5.
+      local pparent ref_cwd
+      pparent=$(dirname "$real")
+      if [[ "$pparent" != "$root_real" ]]; then
+        log "BLOCKED not a direct child of root: $filepath"
+        failed=$((failed + 1))
+        continue
+      fi
+      if [[ ! -d "$real" ]]; then
+        log "BLOCKED not an orphaned ref: $filepath (not a project directory)"
+        failed=$((failed + 1))
+        continue
+      fi
+      ref_cwd=$(resolve_project_cwd "$real" 2>/dev/null) || ref_cwd=""
+      if [[ -z "$ref_cwd" ]]; then
+        log "BLOCKED not an orphaned ref: $filepath (no cwd could be parsed from its session log — fail closed)"
+        failed=$((failed + 1))
+        continue
+      fi
+      if [[ -d "$ref_cwd" ]]; then
+        log "BLOCKED not an orphaned ref: $filepath (its cwd $ref_cwd still exists — the session is LIVE)"
+        failed=$((failed + 1))
+        continue
+      fi
     fi
 
     # NEVER DELETE GIT-TRACKED FILES — wired into the engine, not just written down.

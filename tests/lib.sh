@@ -87,6 +87,29 @@ expect_not_contains() {
   if [[ "$hay" != *"$needle"* ]]; then ok "$desc"; else nok "$desc (unexpectedly found '$needle')"; fi
 }
 
+# Cron-log assertions get their own matchers, because `expect_contains` is a bash SUBSTRING test and
+# pids PREFIX-ALIAS: a needle for pid 123 matches the line written for pid 1234 (verified — needles
+# 123, 1234 and 12345 all match a line for pid 12345). These are the SAFETY PROOFS that gate
+# re-arming the LaunchAgent, so a false pass here is worse than it looks: the positive control
+# ("the genuine orphan appears as a would-kill candidate") could be satisfied by a DIFFERENT pid's
+# line, which means the paired negative ("the attached candidate appears in no would-kill line")
+# would go green even against a cron that logged nothing at all.
+#
+# `would-kill pid <pid> ` — anchored on the field delimiter the log format already provides — is
+# unambiguous: 1234's line reads `would-kill pid 1234 name=`, which cannot contain `pid 123 `.
+expect_would_kill() {
+  local desc="$1" hay="$2" pid="$3"
+  if printf '%s\n' "$hay" | grep -qE "would-kill pid ${pid}( |$)"; then ok "$desc"
+  else nok "$desc (no would-kill line for pid $pid)"; fi
+}
+
+expect_no_would_kill() {
+  local desc="$1" hay="$2" pid="$3"
+  if printf '%s\n' "$hay" | grep -qE "would-kill pid ${pid}( |$)"; then
+    nok "$desc (found a would-kill line naming pid $pid)"
+  else ok "$desc"; fi
+}
+
 expect_alive() {
   local desc="$1" pid="$2"
   if kill -0 "$pid" 2>/dev/null; then ok "$desc"; else nok "$desc (pid $pid is dead)"; fi

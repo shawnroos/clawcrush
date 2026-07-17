@@ -44,9 +44,10 @@ else
 
   expect_alive "F2: cron did NOT kill the orphan (report-only)" "$orphan_pid"
 
+  # Delimiter-anchored: a bare substring needle for pid 123 also matches the line for pid 1234.
   logtxt=$(log_contents)
-  expect_contains "F2: cron logged a dry-run would-kill line for the orphan" \
-    "$logtxt" "Cron dry-run: would-kill pid $orphan_pid"
+  expect_would_kill "F2: cron logged a dry-run would-kill line for the orphan" \
+    "$logtxt" "$orphan_pid"
 fi
 
 # ── F4: delete containment ────────────────────────────────────────────────────────────────
@@ -188,6 +189,55 @@ out=$(crush_in "$empty_repo" scan --global 2>/dev/null)
 expect_json "F5: scan --global still emits valid JSON with fixture projects" "$out"
 names=$(json_get "$out" '",".join(sorted(x["name"] for x in d["global"]["orphaned_refs"]))')
 expect_eq "F5: only the dir whose parsed cwd is gone is orphaned" "-dead-one" "$names"
+
+# ── The ~/.claude/projects delete root re-derives the orphaned predicate ───────────────────
+# scan_global emits `~/.claude/projects` as a delete root (commands/crush-fullcream.md names it
+# explicitly), and the KTD6 backup_only guard keyed on exact string equality with ~/.claude — so
+# handing the PROJECTS SUBDIR as the root walked straight past it. Verified in a sandboxed HOME:
+# a project dir whose newest session JSONL points at a LIVE cwd — one scan_global correctly reports
+# as NOT orphaned — was still rm -rf'd ({"deleted":1}). Containment cannot catch this: an in-root
+# project dir is BY CONSTRUCTION strictly under --root.
+#
+# Same "documented, not wired" shape as the git-tracked rule, with a worse blast radius — a
+# committed file is recoverable from git, a conversation transcript is not. F5 (138/145 LIVE project
+# dirs offered for deletion) is the scan-side regression this backstop has to survive.
+#
+# Backdate everything: is_recent recurses into directories, so a freshly-minted fixture would be
+# refused for the WRONG reason and prove nothing about the predicate.
+for d in "$projects/-live-one" "$projects/-dead-one" "$projects/-unparseable"; do
+  age_path "$d/session.jsonl"
+  age_path "$d"
+done
+
+# (i) a LIVE project dir under the projects root is refused — the engine re-derives the predicate
+out=$(crush delete --root "$projects" "$projects/-live-one" 2>/dev/null)
+expect_eq "projects-root: a LIVE project dir is refused" "0" "$(json_get "$out" 'd["deleted"]')"
+expect_exists "projects-root: the live session's transcripts survive" "$projects/-live-one/session.jsonl"
+expect_contains "projects-root: the refusal is logged as a predicate failure" \
+  "$(log_contents)" "BLOCKED not an orphaned ref"
+
+# (ii) fail CLOSED: a dir whose session log has no parseable cwd is refused too. The dash-encoded
+#      directory NAME is never trusted — it is not invertible, and trusting it is exactly F5.
+out=$(crush delete --root "$projects" "$projects/-unparseable" 2>/dev/null)
+expect_eq "projects-root: a dir with no parseable cwd is refused (fail closed)" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+expect_exists "projects-root: the unparseable dir survives" "$projects/-unparseable/session.jsonl"
+
+# (iii) every other root under ~/.claude is refused outright — ~/.claude/logs must not become a
+#       delete root just because it is not one of the two authorized ones. Refused at the ROOT, so
+#       (like a missing --root) it exits non-zero with its JSON on stderr and never enters the loop.
+crush delete --root "$claude_root/logs" "$claude_root/logs/foo.log" >/dev/null 2>&1
+rc=$?
+if (( rc != 0 )); then ok "projects-root: an unauthorized root under ~/.claude exits non-zero"; else nok "projects-root: an unauthorized root under ~/.claude exits non-zero (got rc=0)"; fi
+expect_exists "projects-root: the file under the unauthorized root survives" "$claude_root/logs/foo.log"
+expect_contains "projects-root: the unauthorized root is logged" \
+  "$(log_contents)" "BLOCKED unauthorized root"
+
+# (iv) THE POSITIVE CONTROL. Without it, every assertion above is satisfied by an engine that
+#      refuses every delete under this root — i.e. by deleting the feature.
+out=$(crush delete --root "$projects" "$projects/-dead-one" 2>/dev/null)
+expect_eq "projects-root: the genuinely orphaned ref IS deleted" "1" "$(json_get "$out" 'd["deleted"]')"
+expect_missing "projects-root: the orphaned ref is really gone" "$projects/-dead-one"
 
 # ── F7: JSON escaping survives quotes and backslashes ─────────────────────────────────────
 

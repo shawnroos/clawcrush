@@ -176,6 +176,194 @@ else
     "safe_kill" "$(json_get "$out" 'd["classification"]')"
 fi
 
+# ── SESSION HOSTS: ppid==1 AND cwd IS a worktree, and STILL never killable ────────────────
+# The daemon guard above only ever exercised cwd=/, which is why the cardinal case survived it: the
+# guard's discriminator was "a daemon's cwd is never a git worktree", and that is FALSE for the
+# process class that HOSTS live Claude sessions.
+#
+# Verified live on this machine before this fix: the three claude-swarm tmux servers (pids 1395,
+# 11558, 20552) are ppid==1 for their entire life — tmux daemonizes by design, launchd is its
+# INTENDED parent — and their cwd resolves to a real git worktree. So `[[ -z "$owner" ]]` was false,
+# the guard was skipped, and classify_pid returned:
+#   {"classification":"safe_kill","owner_worktree":"/…/worktrees/relight-logo-combined"}
+# `crush.sh kill 1395` would have SIGTERMed the tmux server and every live session inside it.
+#
+# cwd is not a sound liveness discriminator, so the fix is a POSITIVE name signal that never
+# consults the cwd at all. Same class: screen, pm2, sshd, zellij.
+
+tmux_exec=$(mk_exec "$TMPROOT/bin" "tmux")
+tmux_pid=$(spawn_orphan "$wt_a" "$tmux_exec" -L test-socket new-session -d)
+
+if [[ -z "$tmux_pid" ]]; then
+  nok "session-host: could not mint the tmux-server candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$tmux_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "safe_kill" ]]; then
+    nok "session-host: THE REGRESSION — a ppid=1 tmux server whose cwd IS a worktree is safe_kill (killing it takes every live session inside it down)"
+  else
+    ok "session-host: a ppid=1 tmux server whose cwd IS a worktree is NOT safe_kill (got $cls)"
+  fi
+  expect_eq "session-host: it is refused outright, so lowfat cannot offer it for consent either" \
+    "protected" "$cls"
+  # Assert the REASON. This process is also ppid==1 in a worktree, so a green verdict alone would
+  # not tell us WHICH rule produced it.
+  expect_contains "session-host: and it is protected BECAUSE it is a session host" \
+    "$(json_get "$out" 'd["reason"]')" "session host"
+
+  # The denylist sits BEFORE the pattern lists, so making tmux visible to the scanner must not make
+  # it killable. CRUSH_EXTRA_PATTERNS is the shipped seam for exactly that (verified pre-fix: with
+  # tmux in the pattern list the scan reported it safe_kill).
+  out=$(CRUSH_EXTRA_PATTERNS=tmux CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$tmux_pid" 2>/dev/null)
+  expect_eq "session-host: putting tmux in the scan's pattern list makes it VISIBLE, never killable" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+
+  crush_in "$wt_a" kill --consent "$tmux_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "session-host: --consent cannot unlock a session host either" "$tmux_pid"
+fi
+
+# ── LAUNCHD MEMBERSHIP: the positive signal, read instead of guessed ──────────────────────
+# `launchctl list` names every job launchd actually MANAGES in this user's domain (brew services,
+# user LaunchAgents, login items). A pid in that list has launchd as its live, managing parent —
+# which is the exact property the old cwd rule was trying to infer. (`launchctl procinfo` is the
+# more direct query but requires root, so it is unusable from the user-context LaunchAgent that
+# matters here.)
+#
+# This runs against REAL launchd-managed pids, not a fixture — a fixture cannot have launchd as its
+# manager, and a mocked membership list would only prove the mock. The assertion is on the REASON:
+# if the launchd check is removed, no pid on the machine reports `launchd-managed` and this goes red
+# (a daemon with cwd=/ would still be protected by the fallback guard — green for the wrong reason).
+
+ld_found=""
+ld_reason=""
+while IFS= read -r ld_pid; do
+  [[ "$ld_pid" =~ ^[0-9]+$ ]] || continue
+  ps -o pid= -p "$ld_pid" >/dev/null 2>&1 || continue
+  ld_out=$(crush_in "$wt_a" classify "$ld_pid" 2>/dev/null)
+  ld_reason=$(json_get "$ld_out" 'd["reason"]')
+  if [[ "$ld_reason" == *"launchd-managed"* ]]; then
+    ld_found="$ld_pid"
+    expect_eq "launchd: a launchd-managed job is protected" \
+      "protected" "$(json_get "$ld_out" 'd["classification"]')"
+    break
+  fi
+done < <(launchctl list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ { print $1 }' | head -40)
+
+if [[ -n "$ld_found" ]]; then
+  ok "launchd: launchd membership is read from launchctl, not inferred from the cwd (pid $ld_found)"
+else
+  nok "launchd: NO pid on this machine classifies via launchd membership — the positive daemon signal is not wired"
+fi
+
+# ── The subject pid IS a live claude session / the daemon ─────────────────────────────────
+# CRUSH_SESSION_RE was applied only to ANCESTORS (owning_session_of starts at the PARENT), so the
+# model had no rule about a process that IS a session. `claude daemon run` (ppid==1, the parent of
+# every live session) classified protected only INCIDENTALLY — because its cwd happens not to
+# resolve to a git repo. Change that accident and the process at the TOP of the session tree comes
+# back safe_kill.
+#
+# Each shape asserts the REASON, not just the verdict: several of these would also reach `protected`
+# by some other rule on some other machine, and a test that cannot distinguish which rule fired
+# cannot go red when the rule under test is deleted.
+
+claude_exec=$(mk_exec "$TMPROOT/bin" "claude")
+ver_exec=$(mk_exec "$TMPROOT/share/claude/versions" "2.1.207")
+
+# (a) A live session in MY OWN worktree, attached. Pre-fix: owner == scan root -> consent_required,
+#     i.e. lowfat would offer to kill somebody's live session running in the same repo.
+read -r sess_pid sess_parent <<< "$(spawn_attached_plain "$wt_a" "$claude_exec" --resume /x/y.jsonl)"
+if [[ -z "$sess_pid" ]]; then
+  nok "self-session: could not mint the live-session candidate (harness failure)"
+else
+  out=$(crush_in "$wt_a" classify "$sess_pid" 2>/dev/null)
+  expect_eq "self-session: a live claude session in MY OWN worktree is protected, not consent_required" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+  expect_contains "self-session: and it is protected BECAUSE it is itself a session" \
+    "$(json_get "$out" 'd["reason"]')" "is itself a live claude session"
+fi
+
+# (b) The version-binary shape (`.../share/claude/versions/2.1.207`), ORPHANED in a worktree.
+#     Pre-fix: owner resolves -> safe_kill.
+verself_pid=$(spawn_orphan "$wt_a" "$ver_exec" --agent-id reviewer@session-01)
+if [[ -z "$verself_pid" ]]; then
+  nok "self-session: could not mint the version-binary candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$verself_pid" 2>/dev/null)
+  expect_eq "self-session: a version-binary session whose cwd IS a worktree is protected (was safe_kill)" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+  expect_contains "self-session: version-binary shape is recognised as a session" \
+    "$(json_get "$out" 'd["reason"]')" "is itself a live claude session"
+fi
+
+# (c) `claude daemon run` with a resolvable worktree cwd — the parent of every live session.
+daemon_run_pid=$(spawn_orphan "$wt_a" "$claude_exec" daemon run --json-path /x/daemon.json)
+if [[ -z "$daemon_run_pid" ]]; then
+  nok "self-session: could not mint the claude-daemon candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$daemon_run_pid" 2>/dev/null)
+  expect_eq "self-session: 'claude daemon run' in a worktree is protected (was safe_kill)" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+
+  crush_in "$wt_a" kill --consent "$daemon_run_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "self-session: --consent cannot unlock the claude daemon" "$daemon_run_pid"
+fi
+
+# ── The DELETED-WORKTREE orphan IS reclaimable (the false-negative twin) ──────────────────
+# The old guard's other half. A genuinely abandoned orphan whose cwd is unresolvable BECAUSE the
+# worktree was deleted has owner="" — so if its command is a generic runtime rather than a named MCP
+# pattern, the guard called it `protected`: permanently unkillable.
+#
+# That is the highest-value leak scenario on this machine, not an edge case: worktrees are automatic
+# and removed after a PR merges (`wtc`), so "session ends, worktree removed, MCP server leaks with a
+# dangling cwd" is the NORMAL end state. A safety-looking rule made the real target invisible — the
+# same shape as the npm-exec allowlist bug.
+#
+# The two states the guard conflated are distinguishable: a daemon's cwd EXISTS (`/`, an install
+# dir); an abandoned session child's cwd has been DELETED. lsof still reports the path either way,
+# so `-d` on it separates them.
+
+leaked_dir="$TMPROOT/leaked-worktree"
+mkdir -p "$leaked_dir"
+leaked_pid=$(spawn_orphan "$leaked_dir" "$node_exec" /some/leaked-mcp-server/index.js)
+rm -rf "$leaked_dir"
+
+if [[ -z "$leaked_pid" ]]; then
+  nok "deleted-cwd: could not mint the leaked-server candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$leaked_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "protected" ]]; then
+    nok "deleted-cwd: THE REGRESSION — an orphan whose worktree was DELETED is protected, i.e. permanently unkillable (this is the normal leak shape after \`wtc\`)"
+  else
+    ok "deleted-cwd: an orphan whose worktree was deleted is not protected (got $cls)"
+  fi
+  expect_eq "deleted-cwd: an orphaned runtime whose cwd has been DELETED is safe_kill" \
+    "safe_kill" "$cls"
+  expect_contains "deleted-cwd: and the reason names the deleted cwd, not 'owner unknown'" \
+    "$(json_get "$out" 'd["reason"]')" "has been deleted"
+
+  # And it is actually reclaimable at act time, not merely labelled reclaimable.
+  crush_in "$wt_a" kill "$leaked_pid" >/dev/null 2>&1
+  sleep 1
+  expect_dead "deleted-cwd: the leaked orphan is actually killed" "$leaked_pid"
+fi
+
+# The negative control that keeps the deleted-cwd rule from becoming a licence: a daemon-shaped
+# orphan whose cwd EXISTS but is not a worktree is still protected. (Asserted above at cwd=/ too;
+# repeated here as the direct counterpart of the rule just added.)
+live_cwd="$TMPROOT/not-a-repo"
+mkdir -p "$live_cwd"
+notrepo_pid=$(spawn_orphan "$live_cwd" "$node_exec" --service)
+if [[ -z "$notrepo_pid" ]]; then
+  nok "deleted-cwd: could not mint the live-cwd daemon candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$notrepo_pid" 2>/dev/null)
+  expect_eq "deleted-cwd: an orphan whose cwd EXISTS but is not a worktree is still protected" \
+    "protected" "$(json_get "$out" 'd["classification"]')"
+fi
+
 # ── Ownership: a SIBLING worktree's live process is NEVER killable ────────────────────────
 # This is the F3 verified live case: MCP servers of a sibling session, scanned from here.
 
@@ -438,10 +626,14 @@ else
   CRUSH_MIN_AGE_MINUTES=0 crush cron >/dev/null 2>&1
   logtxt=$(log_contents)
 
-  expect_contains "cron: the genuine orphan appears as a would-kill candidate" \
-    "$logtxt" "Cron dry-run: would-kill pid $cron_orph_pid"
-  expect_not_contains "cron: the ATTACHED candidate appears in no would-kill line at all" \
-    "$logtxt" "would-kill pid $cron_att_pid"
+  # Delimiter-anchored, NOT a bare substring — see expect_would_kill in lib.sh. A substring needle
+  # for pid 123 matches the line for pid 1234, so the positive control below could be satisfied by
+  # some OTHER pid's line, and the negative control next to it would then be green against a cron
+  # that logged nothing at all.
+  expect_would_kill "cron: the genuine orphan appears as a would-kill candidate" \
+    "$logtxt" "$cron_orph_pid"
+  expect_no_would_kill "cron: the ATTACHED candidate appears in no would-kill line at all" \
+    "$logtxt" "$cron_att_pid"
   expect_alive "cron: the orphan is still alive (report-only)" "$cron_orph_pid"
   expect_alive "cron: the attached candidate is still alive" "$cron_att_pid"
 fi
