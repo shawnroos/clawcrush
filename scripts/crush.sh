@@ -1658,13 +1658,38 @@ do_kill() {
       continue
     fi
 
-    if [[ "$classification" == "consent_required" ]]; then
+    # DEFAULT DENY, expressed as a POSITIVE authorization rather than a re-check of the
+    # classification string. Exactly two things authorize a kill, and nothing else does.
+    #
+    # Not `if [[ "$classification" != "safe_kill" ]]; then refuse; fi` placed after the consent
+    # block: a consented pid is STILL classified consent_required at that point, so that form
+    # refuses every consented kill and silently deletes the --consent feature. (Caught by the
+    # "it IS killed with an explicit per-pid --consent" control, which exists because a
+    # fail-closed fix that quietly disables the thing it guards is the standing hazard in this file.)
+    local authorized=0
+
+    if [[ "$classification" == "safe_kill" ]]; then
+      authorized=1
+    elif [[ "$classification" == "consent_required" ]]; then
       if [[ "$consent" != *" $pid "* ]]; then
         refused=$((refused + 1))
         log "REFUSED PID $pid — consent_required, no --consent given ($reason)"
         continue
       fi
       log "CONSENTED PID $pid ($reason)"
+      authorized=1
+    fi
+
+    # Anything else — including the empty string — is unknown, and an unknown never kills. The
+    # dispatch used to handle gone/protected/consent_required by name and let ANY other value fall
+    # through to `kill "$pid"`. Not reachable today (classify_pid printf's one of four literals on
+    # every path), so this is defense in depth, not a fix for a live defect. It earns its place
+    # because this file's whole thesis is that unknowns fail closed, and this was the one place
+    # where an unknown killed: a drifted caller, a new classification, or a truncated read.
+    if (( authorized != 1 )); then
+      refused=$((refused + 1))
+      log "REFUSED PID $pid — unknown classification '$classification' (default deny)"
+      continue
     fi
 
     local cmd win grace
@@ -1853,8 +1878,26 @@ do_delete() {
       continue
     fi
 
-    if is_safe "$filepath"; then
-      log "BLOCKED safe pattern: $filepath"
+    # Checked against the RESOLVED path as well as the literal one. Every sibling guard here
+    # validates `$real`; this one validated only `$filepath`, so a protected directory reached
+    # through a differently-named symlink was simply not protected — the substring never appeared:
+    #
+    #   ln -s node_modules link
+    #   delete --root $R $R/link/pkg/index.js      -> {"deleted":1}  the node_modules file DESTROYED
+    #   delete --root $R $R/node_modules/pkg/index.js -> {"deleted":0,"failed":1}  same file, blocked
+    #
+    # Same file, same --root, opposite outcomes decided purely by the literal string. With
+    # `ln -s .git store`, `delete --root $R $R/store/HEAD` took out the repo's HEAD and config
+    # ("fatal: not a git repository" afterwards). The git-tracked guard does not cover it — that one
+    # correctly validates `$real`, but .git internals are not tracked files. Containment passes by
+    # construction because the target really is under --root.
+    #
+    # This violates a rule CLAUDE.md lists as hardcoded and never overridden, and it is the same
+    # polarity defect as the others: "is the RESOLVED target protected?" was never asked, and the
+    # unasked question resolved to "go ahead". Both forms are checked — the literal one still earns
+    # its keep for a path that is protected by NAME but does not resolve (a broken symlink).
+    if is_safe "$filepath" || is_safe "$real"; then
+      log "BLOCKED safe pattern: $filepath (resolves to $real)"
       failed=$((failed + 1))
       continue
     fi

@@ -275,4 +275,59 @@ else
     "$ctrl" "$(json_get "$out" '[x["path"] for x in d["slop"] if not x["tracked"]][0]')"
 fi
 
+# ── SAFE_PATTERNS must be judged on the RESOLVED path, not the literal string ──────────────
+# is_safe substring-matched the UNRESOLVED $filepath while every sibling guard in do_delete
+# validated $real. A protected dir reached through a differently-named symlink therefore was not
+# protected at all — the substring simply never appeared. Proven before the fix:
+#   ln -s node_modules link
+#   delete --root $R $R/link/pkg/index.js         -> {"deleted":1}  the node_modules file DESTROYED
+#   delete --root $R $R/node_modules/pkg/index.js -> {"deleted":0}  same file, blocked
+# and with `ln -s .git store`, deleting $R/store/HEAD left "fatal: not a git repository".
+#
+# The git-tracked guard does not cover this: it validates $real correctly, but .git internals are
+# not tracked files. Containment passes by construction — the target really is under --root.
+# Violates a CLAUDE.md rule listed as hardcoded and never overridden.
+
+sym_repo=$(mk_repo "$TMPROOT/symrepo")
+mkdir -p "$sym_repo/node_modules/pkg"
+printf 'REAL PACKAGE CODE\n' > "$sym_repo/node_modules/pkg/index.js"
+touch -t 202001010000 "$sym_repo/node_modules/pkg/index.js"
+ln -s node_modules "$sym_repo/link"
+
+out=$(crush delete --root "$sym_repo" "$sym_repo/link/pkg/index.js" 2>/dev/null)
+expect_eq "safe-symlink: deleting a node_modules file VIA A SYMLINK is refused" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+if [[ -f "$sym_repo/node_modules/pkg/index.js" ]]; then
+  ok "safe-symlink: the real node_modules file survives"
+else
+  nok "safe-symlink: THE REGRESSION — the real node_modules file was DESTROYED through the symlink"
+fi
+
+# .git via a symlink — the unrecoverable case.
+ln -s .git "$sym_repo/store"
+find "$sym_repo/.git" -exec touch -t 202001010000 {} \; 2>/dev/null || true
+out=$(crush delete --root "$sym_repo" "$sym_repo/store/HEAD" 2>/dev/null)
+expect_eq "safe-symlink: deleting .git/HEAD via a symlink is refused" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+if git -C "$sym_repo" status --short >/dev/null 2>&1; then
+  ok "safe-symlink: the repo is still a repo"
+else
+  nok "safe-symlink: THE REGRESSION — the sandbox repo's .git was destroyed through the symlink"
+fi
+
+# The literal path must still be blocked (the guard that already worked).
+printf 'REAL PACKAGE CODE\n' > "$sym_repo/node_modules/pkg/index.js"
+touch -t 202001010000 "$sym_repo/node_modules/pkg/index.js"
+out=$(crush delete --root "$sym_repo" "$sym_repo/node_modules/pkg/index.js" 2>/dev/null)
+expect_eq "safe-symlink: the literal node_modules path is still refused" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+
+# RECALL CONTROL — the resolved-path check must not become a blanket refusal. Without this, the
+# fix is satisfied by a do_delete that refuses everything.
+printf 'debug junk\n' > "$sym_repo/debug-x.log"
+touch -t 202001010000 "$sym_repo/debug-x.log"
+out=$(crush delete --root "$sym_repo" "$sym_repo/debug-x.log" 2>/dev/null)
+expect_eq "safe-symlink: RECALL — a genuine slop file is still deleted" \
+  "1" "$(json_get "$out" 'd["deleted"]')"
+
 finish
