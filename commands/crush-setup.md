@@ -31,9 +31,16 @@ Present the results in formatted sections. Use this layout:
 
 **Zombie Processes:**
 
-| # | PID | Name | Age | Reason |
-|---|-----|------|-----|--------|
+| # | PID | Name | Age | Owner | Classification | Reason |
+|---|-----|------|-----|-------|----------------|--------|
 (list each zombie from the scan)
+
+Only `safe_kill` entries are ones the engine has positive proof are abandoned (`ppid=1` **and** a
+deleted cwd, an MCP-server signature, or a dev-stack/headless-browser process holding no listening
+socket — `ppid=1` on its own is a lifecycle fact, not abandonment). `consent_required` means the
+process is attached to a live parent, and `protected` means it belongs to another worktree's live
+session, is a daemon, is serving on a socket, or is on the never-kill allowlist — those are shown so
+the user understands what clawcrush will *not* touch.
 
 If no zombies: "No zombie processes found."
 
@@ -92,7 +99,19 @@ docs/brainstorms/**
 .beads/
 ```
 
-## Step 5: Scheduled Auto-Crush
+## Step 5: Scheduled Scan (report-only)
+
+**The scheduled job does not kill anything.** `crush.sh cron` is a report-only dry run: it logs
+`Cron dry-run: would-kill pid …` for genuine orphans past the age gate, and kills nothing.
+
+This is deliberate. The old cron SIGTERM'd every pid the scanner returned, and the scanner counted a
+process as a zombie purely for being older than an hour — so it was an hourly mass-kill of every live
+session's MCP servers, suppressed only by an unrelated bug in the scheduler's locking. Re-arming it as
+an actual killer is *unbuilt*, and should only be considered once the dry-run logs have soaked long
+enough to show the classifier is precise in practice.
+
+Describe it to the user as what it is: an hourly **scan that writes a report**, so they can see what
+clawcrush *would* reclaim before trusting it to reclaim anything.
 
 First, detect if que-do is available:
 
@@ -104,11 +123,11 @@ test -d "$HOME/.slate-queue" && test -f "$HOME/.slate-queue/queue.sh" && echo "Q
 
 Use AskUserQuestion to ask:
 
-"Enable automatic zombie crushing every hour?
+"Enable an hourly zombie **scan** (report-only — it logs what it would reclaim, and kills nothing)?
 
 - **que-do** (recommended) — register with que-do scheduler. Gets retry logic, stall detection, manifest tracking, and Raycast visibility.
 - **launchagent** — standalone macOS LaunchAgent (simpler, no que-do dependency)
-- **skip** — no auto-crush (run `/crush` manually)"
+- **skip** — no scheduled scan (run `/crush` manually)"
 
 **If que-do selected:**
 
@@ -130,9 +149,10 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/crush.sh setup-launchagent
 
 Use AskUserQuestion to ask:
 
-"Enable automatic zombie crushing every hour? This installs a macOS LaunchAgent that silently kills orphaned MCP processes on a schedule.
+"Enable an hourly zombie scan? This installs a macOS LaunchAgent that scans on a schedule and writes a
+report to `~/.claude/logs/clawcrush.log`. It is report-only — it kills nothing.
 
-- **Yes** — install hourly auto-crush
+- **Yes** — install the hourly scan
 - **No** — skip (you can always run /crush manually)"
 
 If yes, run:
@@ -148,5 +168,5 @@ Report the result.
 Show a brief summary:
 - `.crushignore` created with X patterns
 - Default mode: lowfat/fullcream
-- Auto-crush: que-do / launchagent / skipped
+- Scheduled scan: que-do / launchagent / skipped — **report-only, kills nothing**
 - "Run `/crush` to start crushing."
