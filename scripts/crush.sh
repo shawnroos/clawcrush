@@ -369,10 +369,19 @@ is_recent() {
 }
 
 # Check if a file matches any crushignore pattern
+# POLARITY: returning 0 ("ignored") PREVENTS a delete, so every unknown must return 0.
 matches_crushignore() {
   local filepath="$1"
   local ignorefile="$2"
+
+  # No ignore file at all: nothing is declared protected. Not an unknown — an empty answer.
   [[ ! -f "$ignorefile" ]] && return 1
+
+  # It EXISTS but cannot be read (permissions, a bad mount). The user declared protections and we
+  # cannot see what they are, so we cannot prove this file is not among them. Fail closed — the
+  # `while read < "$ignorefile"` below would otherwise silently execute zero iterations and return
+  # "not ignored", i.e. delete everything the user tried to protect.
+  [[ ! -r "$ignorefile" ]] && return 0
 
   local basename
   basename=$(basename "$filepath")
@@ -404,13 +413,22 @@ matches_crushignore() {
 
 # ── Process attribution: the two-axis model ────
 #
-#   LIVENESS  — orphan <=> ppid == 1. Reparenting to launchd is immediate on parent death, so
-#               "no live parent" is exactly ppid==1. Crisp; not a heuristic.
+#   LIVENESS  — ppid == 1 is NECESSARY for abandonment and NEVER SUFFICIENT. It is a LIFECYCLE
+#               fact: launchd jobs, tmux/screen/pm2/sshd, self-daemonizing servers (agent-browser)
+#               and any `nohup … & disown`'d dev server are ppid==1 for their ENTIRE LIFE. So a
+#               kill also requires POSITIVE PROOF of abandonment — a deleted cwd, an MCP-server
+#               signature, or a dev-stack/headless-browser process holding no listening socket.
+#               Absent proof: protected. See classify_pid.
 #   OWNERSHIP — which worktree owns the process (lsof cwd -> git toplevel), and which live
-#               claude session, if any, is its ancestor.
+#               claude session, if any, is its ancestor. Ownership NEVER testifies to abandonment;
+#               inferring that from a cwd is the defect that produced four consecutive P0s.
 #
 # Age is NOT an axis. It is metadata and the cron gate. A long-running `ng serve` is by
 # definition old and by definition alive — that is the whole point.
+#
+# This comment claimed "orphan <=> ppid == 1. Crisp; not a heuristic." for six review rounds after
+# the code stopped believing it. A stale contract in a comment is not cosmetic here: the command
+# docs carried the same stale rule and drive an autonomous mode.
 
 # Window a ps command line to its command HEAD: argv[0] plus following non-flag words, stopping
 # at the first flag. Without this, `grep -F` matched the whole ps line including arguments, so
@@ -734,27 +752,16 @@ is_launchd_managed() {
 # of those really does mean the session that owned it is gone. A generic runtime (node, bun, a
 # browser) carries no such signature — it is equally likely to be a launchd-managed service that
 # has had ppid==1 since boot.
-matches_specific_pattern() {
-  local win="$1" p
-  for p in "${MCP_PATTERNS[@]}"; do
-    if window_matches_pattern "$win" "$p"; then return 0; fi
-  done
-  for p in "${DEV_PATTERNS[@]}"; do
-    if window_matches_pattern "$win" "$p"; then return 0; fi
-  done
-  if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
-    local oldifs="$IFS"
-    IFS=':'
-    for p in $CRUSH_EXTRA_PATTERNS; do
-      if [[ -n "$p" ]] && window_matches_pattern "$win" "$p"; then
-        IFS="$oldifs"
-        return 0
-      fi
-    done
-    IFS="$oldifs"
-  fi
-  return 1
-}
+# `matches_specific_pattern` lived here and is deliberately GONE, not merely unused.
+#
+# It answered "is this window an MCP server OR a dev-stack process?" — one predicate over both
+# lists, carrying one premise: "ppid==1 proves its session died". That premise is true for
+# MCP_PATTERNS and FALSE for DEV_PATTERNS (`nohup … & disown` makes a dev server ppid==1 from
+# birth), and lumping them shared the weakest one. That is what classified a live `ng serve` holding
+# 127.0.0.1:3007 as safe_kill. See matches_mcp_pattern / matches_dev_pattern, which split it.
+#
+# Left as dead code it would be a loaded gun: it still compiles, still looks like the obvious helper
+# to reach for, and calling it silently restores the bug. Use the split predicates.
 
 # The git worktree containing a directory.
 worktree_of() {
@@ -775,6 +782,23 @@ current_scan_root() {
 }
 
 # Walk ancestors for a live Claude session. Prints its pid, or fails.
+# POLARITY AUDIT: returning a session PROTECTS (line ~1009 refuses another session's process), so
+# returning "" is the unsafe direction. Deliberately left as-is, and here is the argument, because
+# "fail closed everywhere" is itself a way to break this tool:
+#
+#   - The walk terminates at ppid 1 and returns 1 -> session="". That is not an error, it is the
+#     ANSWER, and it is the overwhelmingly common one: most candidates genuinely have no live claude
+#     ancestor. Treating it as "unknown -> protect" would protect nearly everything and drop recall
+#     to zero — the exact failure the veto, the lsof rework and do_kill's default-deny each hit here.
+#   - A dead ancestor cannot hide a live session: if a grandparent dies the parent reparents to 1
+#     immediately, so the walk still terminates correctly.
+#   - The genuine gap: a TRANSIENT `ps` failure on the one ancestor that IS the session (line
+#     `cmd=$(pid_command "$p") || cmd=""`) skips it and keeps walking -> session="". Rare, and it
+#     lands on consent_required, NOT safe_kill — still human-gated per item, and fullcream/cron
+#     never pass --consent. Blast radius is bounded by a human decision, so the cure is worse.
+#
+# Not every unknown deserves a fail-closed. This one degrades to a human gate, and its "unknown" is
+# almost always the legitimate answer.
 owning_session_of() {
   local p guard=0 cmd win
   p=$(pid_ppid "$1" 2>/dev/null) || return 1
@@ -1898,6 +1922,23 @@ do_delete() {
     # its keep for a path that is protected by NAME but does not resolve (a broken symlink).
     if is_safe "$filepath" || is_safe "$real"; then
       log "BLOCKED safe pattern: $filepath (resolves to $real)"
+      failed=$((failed + 1))
+      continue
+    fi
+
+    # .crushignore is enforced HERE, not only in scan_slop. It is the user's own protection list —
+    # CLAUDE.md calls it a required gate — and it was consulted ONLY while deciding what to REPORT.
+    # Naming a protected file directly deleted it:
+    #   .crushignore: keepme.log
+    #   scan  -> keepme.log correctly absent from slop
+    #   delete --root $R $R/keepme.log -> {"deleted":1}   the user's protected file, gone
+    # That is this file's own stated threat model (see do_kill: "a guard that only gates DETECTION
+    # leaves the act path wide open to a drifted or hallucinating caller") applied to itself. The
+    # engine is the backstop; a caller that names a path must not be able to route around the user's
+    # declared protections. Checked against the resolved path too, for the symlink reason above.
+    if matches_crushignore "$filepath" "$root_real/.crushignore" \
+       || matches_crushignore "$real" "$root_real/.crushignore"; then
+      log "BLOCKED .crushignore: $filepath (resolves to $real)"
       failed=$((failed + 1))
       continue
     fi

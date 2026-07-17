@@ -330,4 +330,46 @@ out=$(crush delete --root "$sym_repo" "$sym_repo/debug-x.log" 2>/dev/null)
 expect_eq "safe-symlink: RECALL — a genuine slop file is still deleted" \
   "1" "$(json_get "$out" 'd["deleted"]')"
 
+# ── .crushignore must gate the ACT path, not only the scan ────────────────────────────────
+# matches_crushignore was called ONLY from scan_slop, so the user's own protection list decided
+# what got REPORTED and nothing else. Naming a protected file directly deleted it:
+#   .crushignore: keepme.log
+#   scan -> correctly absent from slop
+#   delete --root $R $R/keepme.log -> {"deleted":1}   the user's protected file, gone
+# That is this file's own stated threat model ("a guard that only gates DETECTION leaves the act
+# path wide open to a drifted or hallucinating caller") applied to itself.
+
+ci_repo=$(mk_repo "$TMPROOT/cirepo")
+printf '# default: lowfat\nkeepme.log\n' > "$ci_repo/.crushignore"
+printf 'PRECIOUS — user explicitly protected this\n' > "$ci_repo/keepme.log"
+touch -t 202001010000 "$ci_repo/keepme.log"
+
+out=$(crush delete --root "$ci_repo" "$ci_repo/keepme.log" 2>/dev/null)
+expect_eq "crushignore-act: deleting a .crushignore'd file by name is refused" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+if [[ -f "$ci_repo/keepme.log" ]]; then
+  ok "crushignore-act: the user's protected file survives being named directly"
+else
+  nok "crushignore-act: THE REGRESSION — a file the user protected in .crushignore was DELETED"
+fi
+
+# RECALL — the gate must not refuse everything. Without this the fix is satisfied by a do_delete
+# that never deletes anything at all.
+printf 'junk\n' > "$ci_repo/debug-y.log"
+touch -t 202001010000 "$ci_repo/debug-y.log"
+out=$(crush delete --root "$ci_repo" "$ci_repo/debug-y.log" 2>/dev/null)
+expect_eq "crushignore-act: RECALL — a file NOT in .crushignore is still deleted" \
+  "1" "$(json_get "$out" 'd["deleted"]')"
+
+# An UNREADABLE protection list is an unknown, and unknowns fail closed. The `while read` loop
+# would otherwise run zero iterations and report "not ignored" — i.e. delete everything the user
+# tried to protect, silently.
+printf 'junk2\n' > "$ci_repo/debug-z.log"
+touch -t 202001010000 "$ci_repo/debug-z.log"
+chmod 000 "$ci_repo/.crushignore"
+out=$(crush delete --root "$ci_repo" "$ci_repo/debug-z.log" 2>/dev/null)
+chmod 644 "$ci_repo/.crushignore"
+expect_eq "crushignore-act: an UNREADABLE .crushignore fails closed (refuses the delete)" \
+  "0" "$(json_get "$out" 'd["deleted"]')"
+
 finish
