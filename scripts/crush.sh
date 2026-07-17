@@ -497,6 +497,126 @@ matches_session_host() {
   return 1
 }
 
+# THE PATTERN SPLIT. `matches_specific_pattern` lumped MCP_PATTERNS and DEV_PATTERNS together and
+# read a hit as "this can only be a session's child, so ppid==1 proves the session died". That
+# premise is true for ONE of the two lists and false for the other:
+#
+#   MCP_PATTERNS — an MCP server exists only ever as a claude session's child. Nobody launches one
+#                  detached. ppid==1 really does mean the session that owned it is gone.
+#   DEV_PATTERNS — `nohup npm run start:dev1 > log 2>&1 < /dev/null & disown` is the DOCUMENTED way
+#                  dev servers are launched in these worktrees (the harness reaps non-detached
+#                  ones). So a dev server is ppid==1 FROM BIRTH, and the premise is simply false.
+#
+# Verified live: pid 23675 `npm exec ng serve --configuration=dev --port 3007`, ppid==1, 4h15m old,
+# child 23709 holding `127.0.0.1:3007 (LISTEN)` — classified safe_kill off the shared premise.
+matches_mcp_pattern() {
+  local win="$1" p
+  for p in "${MCP_PATTERNS[@]}"; do
+    if window_matches_pattern "$win" "$p"; then return 0; fi
+  done
+  return 1
+}
+
+# CRUSH_EXTRA_PATTERNS is a harness seam, and its fixtures are dev-stack shaped — so it lands in the
+# dev bucket, behind the veto, rather than inheriting the MCP list's stronger premise.
+matches_dev_pattern() {
+  local win="$1" p
+  for p in "${DEV_PATTERNS[@]}"; do
+    if window_matches_pattern "$win" "$p"; then return 0; fi
+  done
+  if [[ -n "${CRUSH_EXTRA_PATTERNS:-}" ]]; then
+    local oldifs="$IFS"
+    IFS=':'
+    for p in $CRUSH_EXTRA_PATTERNS; do
+      if [[ -n "$p" ]] && window_matches_pattern "$win" "$p"; then
+        IFS="$oldifs"
+        return 0
+      fi
+    done
+    IFS="$oldifs"
+  fi
+  return 1
+}
+
+# AUTOMATION BROWSER — a CONJUNCTION over the raw command, and the only place in this file that is
+# allowed to read flags.
+#
+# The generic-runtime category (`chrome`, `node`, `bun`) cannot authorize a kill: a bare `chrome` at
+# ppid==1 is indistinguishable from the user's Dock-launched browser, and a bare `node` could be a
+# build watcher, an MCP server, or agent-browser. But a LEAKED automation browser is real toil, and
+# dropping it entirely would leave U2 unable to see the thing it was built for.
+#
+# `command_window` stops at the first `-` token by design (F7: matching on the full ps line lets any
+# process whose ARGS merely mention a pattern get flagged), so `--headless` is invisible to every
+# pattern list — putting it in DEV_PATTERNS is dead code, which is exactly the trap this comment
+# exists to stop the next person falling into. It has to be read off the raw command.
+#
+# Why this conjunction is sound where a bare flag match would not be:
+#   - The window must ALREADY be a browser, so `nvim --headless` (a real scripting idiom) cannot hit.
+#   - `--headless` specifically. NOT `--remote-debugging-port`: the user's own Chrome carries that
+#     one, so keying on it would classify their real browser safe_kill.
+#   - A Dock-launched browser is never headless. There is no path from this predicate to the user's
+#     actual browsing session.
+matches_automation_browser() {
+  local win="$1" raw="$2" p
+  local is_browser=1
+  for p in "chromium" "Chromium" "chrome" "Google Chrome"; do
+    if window_matches_pattern "$win" "$p"; then is_browser=0; break; fi
+  done
+  (( is_browser == 0 )) || return 1
+  [[ "$raw" == *"--headless"* ]]
+}
+
+# pid_tree_of <pid> -> "<pid> <child> <grandchild> …"
+#
+# The veto below MUST look at descendants, not just the subject. The live counterexample is exactly
+# this shape: pid 23675 is the `npm exec` wrapper and holds no socket at all — its child 23709 is
+# the node process holding 127.0.0.1:3007. Vetoing on the subject alone would have missed it and
+# killed the wrapper, taking the server with it.
+#
+# bash 3.2: no associative arrays, so this walks one `ps` snapshot breadth-first with space-padded
+# string membership. Depth-bounded against a pid-reuse cycle.
+pid_tree_of() {
+  local root="$1"
+  local snapshot frontier=" $root " all=" $root " next child parent depth=0
+  snapshot=$(ps -o pid=,ppid= -ax 2>/dev/null || true)
+  while [[ -n "${frontier// /}" ]] && (( depth < 12 )); do
+    next=""
+    while read -r child parent; do
+      [[ -z "$child" || -z "$parent" ]] && continue
+      case "$frontier" in
+        *" $parent "*)
+          case "$all" in
+            *" $child "*) ;;
+            *) all="$all$child "; next="$next$child " ;;
+          esac
+          ;;
+      esac
+    done <<< "$snapshot"
+    frontier=" $next"
+    depth=$((depth + 1))
+  done
+  printf '%s' "$all"
+}
+
+# THE LIVENESS VETO. A process (or any descendant) holding a LISTENING TCP socket is, by definition,
+# serving someone — so it is not abandoned, whatever its ppid says.
+#
+# This is a BEHAVIOURAL signal, and that is the whole point. Rounds 2 and 3 both tried to carve out
+# daemons by NAME (a cwd rule, then a session-host list), and both failed on the first daemon nobody
+# had thought to enumerate. "Is it serving traffic right now?" is a question about the process
+# itself, so it holds for daemons that are not on any list — including ones that do not exist yet.
+#
+# Only consulted for orphaned dev-stack candidates, so the lsof cost is bounded to a handful of pids
+# on a box whose defining condition is that it is already contended.
+holds_listening_socket() {
+  local tree plist
+  tree=$(pid_tree_of "$1")
+  plist=$(printf '%s' "$tree" | sed 's/^ *//; s/ *$//; s/  */,/g')
+  [[ -z "$plist" ]] && return 1
+  lsof -nP -iTCP -sTCP:LISTEN -a -p "$plist" 2>/dev/null | grep -q LISTEN
+}
+
 # LAUNCHD MEMBERSHIP — the positive signal the old daemon guard was trying to INFER from the cwd.
 #
 # `launchctl list` prints `PID<TAB>Status<TAB>Label` for every job launchd manages in this user's
@@ -727,32 +847,67 @@ classify_pid() {
       return 0
     fi
 
-    # (2) A session-child signature (named MCP server, dev-stack process) — its session is provably
-    #     gone, so ppid==1 really is abandonment.
-    # (3) Its cwd was RESOLVED and has since been DELETED — the worktree it was spawned in is gone.
-    #     This is the `wtc`-after-merge leak, and the old guard hid it.
-    # (4) It has a resolvable owning worktree — an abandoned child still sitting in its worktree.
-    if matches_specific_pattern "$win"; then
-      reason="ppid=1 (orphaned), session-child signature"
-      [[ -n "$owner" ]] && reason="ppid=1 (orphaned), owner: $owner"
-      printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
-      return 0
-    fi
+    # ppid==1 ALONE NEVER KILLS. It is necessary, never sufficient — a pid reaches this point only
+    # by then producing a POSITIVE signal that it was abandoned.
+    #
+    # This inverted after the third consecutive review round found the same defect. The guard used
+    # to end with `owner != "" -> safe_kill`: an orphan with a resolvable owning worktree was read
+    # as "an abandoned child still sitting in its worktree". That infers ABANDONMENT from
+    # OWNERSHIP, which is round 2's cwd rule wearing a different hat, and the asymmetry gave it
+    # away — `owner == ""` fell through to protected while `owner != ""` became safe_kill, so
+    # having an identifiable owner made a process MORE killable. A cwd can testify to who owns a
+    # process. It can never testify to whether that process was abandoned.
+    #
+    # Verified live: a self-daemonized `agent-browser` (pid 82997 — LISTENING on localhost:54172,
+    # ESTABLISHED to its Chrome, live child, cwd in a sibling worktree) took that branch and came
+    # back safe_kill, together with its Chrome. It is ppid==1 by design, is not launchd-managed,
+    # and carries no session-host name — so no enumeration of daemons saw it. Enumerating daemons
+    # is unbounded and had failed once per round; asking for positive proof of abandonment is not.
+    #
+    # So exactly two signals prove abandonment, and nothing else does:
+
+    # (1) Its cwd RESOLVED and has since been DELETED — the worktree it was spawned in is gone, so
+    #     nothing can still want it. The one signal in this file that is unambiguously about
+    #     abandonment rather than lifecycle. This is the `wtc`-after-merge leak.
     if [[ "$cwd_state" == "gone" ]]; then
       printf 'safe_kill|true||%s|ppid=1 (orphaned), its cwd (%s) has been deleted — abandoned' \
         "$session" "$_CWD_PATH"
       return 0
     fi
-    if [[ -n "$owner" ]]; then
-      printf 'safe_kill|true|%s|%s|ppid=1 (orphaned), owner: %s' "$owner" "$session" "$owner"
+
+    # (2) An MCP-server signature. These exist ONLY as a claude session's child and are never
+    #     launched detached, so ppid==1 does prove the owning session is gone. See matches_mcp_pattern.
+    if matches_mcp_pattern "$win"; then
+      reason="ppid=1 (orphaned), MCP-server signature — its session is gone"
+      [[ -n "$owner" ]] && reason="$reason, owner: $owner"
+      printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
       return 0
     fi
 
-    # Neither a session-child signature, nor a deleted cwd, nor an owning worktree: a live cwd that
-    # is not a repo (a daemon's `/` or install dir), or an unreadable one. Refused outright rather
-    # than merely left unkilled — `consent_required` would still let lowfat put the user's brew
-    # service in a table and kill it on a stray selection.
-    printf 'protected|true||%s|ppid=1 with no session-child signature, no owning worktree and a live cwd — launchd/daemon shape, never killed' "$session"
+    # (3) A dev-stack signature, gated by the LIVENESS VETO. ppid==1 does NOT prove abandonment here
+    #     — nohup+disown is the documented launch path — so the name alone cannot authorize a kill.
+    #     Ask the process what it is DOING instead: serving traffic, or not.
+    if matches_dev_pattern "$win" || matches_automation_browser "$win" "$cmd"; then
+      if holds_listening_socket "$pid"; then
+        reason="ppid=1 but it (or a child) holds a LISTENING socket — serving, never killed"
+        [[ -n "$owner" ]] && reason="$reason, owner: $owner"
+        printf 'protected|true|%s|%s|%s' "$owner" "$session" "$reason"
+        return 0
+      fi
+      reason="ppid=1 (orphaned), dev-stack signature, holds no listening socket — finished/abandoned"
+      [[ -n "$owner" ]] && reason="$reason, owner: $owner"
+      printf 'safe_kill|true|%s|%s|%s' "$owner" "$session" "$reason"
+      return 0
+    fi
+
+    # No positive abandonment signal. FAIL CLOSED — and `protected`, not `consent_required`, because
+    # consent_required would still let lowfat put a live daemon in a table and kill it on a stray
+    # selection. The cost is a false negative: an abandoned process whose name is in no pattern list
+    # and whose worktree still exists survives, and leaks until its cwd goes away. That is the right
+    # trade — a missed zombie costs RAM, a false positive SIGTERMs live work.
+    reason="ppid=1 with no positive abandonment signal (live cwd, no session-child signature) — daemon shape, never killed"
+    [[ -n "$owner" ]] && reason="$reason, owner: $owner"
+    printf 'protected|true|%s|%s|%s' "$owner" "$session" "$reason"
     return 0
   fi
 

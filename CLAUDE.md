@@ -28,18 +28,37 @@ ClawCrush finds and destroys zombie processes and repo slop spawned by Claude Co
 
 ## Safety Rules (hardcoded, never overridden)
 
-**Age is NEVER sufficient to call a process a zombie.** Every candidate is classified on two axes:
+**Age is NEVER sufficient to call a process a zombie. Neither is `ppid == 1`.** Every candidate is
+classified on two axes:
 
-- **Liveness** — a process is an orphan if and only if `ppid == 1`. Reparenting to launchd is
-  immediate on parent death, so this is crisp, not a heuristic.
+- **Liveness** — `ppid == 1` is **necessary but never sufficient** for abandonment. It is a
+  *lifecycle* fact, not an abandonment fact: launchd services, tmux/screen/pm2/sshd, and
+  self-daemonizing session servers (`agent-browser`) are `ppid == 1` for their **entire life** — that
+  is their designed steady state, not the residue of a dead parent. So an orphan is only *abandoned*
+  when it also carries a **positive abandonment signal**, of which there are exactly two:
+  1. a **session-child signature** — a named MCP server or dev-stack process, which exists only as a
+     child of a claude session, so `ppid == 1` proves that session is gone; or
+  2. its **cwd resolved and has since been deleted** — the worktree is gone, so nothing wants it.
+
+  Absent both, it fails closed to `protected`. Do **not** try to fix this by enumerating daemons to
+  skip — that list is unbounded and it failed once per review round. Demand proof of abandonment.
 - **Ownership** — which worktree owns it (`lsof` cwd → git toplevel), and which live `claude`
-  session, if any, is its ancestor.
+  session, if any, is its ancestor. **Ownership never testifies to abandonment.** A cwd says who
+  owns a process, never whether it was abandoned; inferring the latter from the former is the defect
+  that produced three consecutive P1s.
 
-|                      | orphan (`ppid=1`)                   | attached (live parent)        |
+"orphan" below means `ppid == 1` **and** a positive abandonment signal:
+
+|                      | orphan (abandoned)                  | attached (live parent)        |
 |----------------------|-------------------------------------|-------------------------------|
 | **my worktree**      | `safe_kill`                         | `consent_required`            |
 | **another worktree** | `safe_kill` (reported with owner)   | `protected` — **NEVER KILL**  |
-| **owner unknown**    | `safe_kill` (orphanhood is crisp)   | `consent_required` (fail closed) |
+| **owner unknown**    | `safe_kill`                         | `consent_required` (fail closed) |
+
+`ppid == 1` **without** a positive abandonment signal is `protected` in every column. The cost is a
+false negative — an abandoned process whose name is in no pattern list and whose worktree still
+exists survives until its cwd goes away. That is the intended trade: a missed zombie costs RAM, a
+false positive SIGTERMs live work.
 
 - `protected` is refused **unconditionally**. No flag — `--consent` included — unlocks it. There is
   no caller-reachable path to kill a protected pid.

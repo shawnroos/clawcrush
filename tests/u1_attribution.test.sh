@@ -165,15 +165,62 @@ else
   expect_alive "daemon-guard: --consent cannot unlock a daemon-shaped process either" "$daemon_pid"
 fi
 
-# The positive control that keeps the guard honest: the SAME generic runtime, orphaned, but sitting
-# in a real worktree — a genuinely abandoned session child — is still reclaimed.
-abandoned_pid=$(spawn_orphan "$wt_a" "$node_exec" --abandoned)
+# The positive control that keeps the guard honest: an orphan that DOES carry a positive
+# abandonment signal is still reclaimed. It must be a session-child signature (a shipped
+# MCP_PATTERNS name), not a generic runtime.
+#
+# This control used to spawn a bare `node`, and asserted safe_kill purely because its cwd resolved
+# to a worktree. That encoded the very rule that produced round 3's P1 — `owner != "" -> safe_kill`,
+# which reads ABANDONMENT out of OWNERSHIP. A generic `node` orphan in a live worktree is now
+# `protected`, so the control has to prove the thing the contract actually claims: that a process
+# which can only ever exist as a session's child is reclaimed once that session is gone.
+abandoned_pid=$(spawn_orphan "$wt_a" "$mcp" --abandoned)
 if [[ -z "$abandoned_pid" ]]; then
   nok "daemon-guard: could not mint the abandoned-child candidate (harness failure)"
 else
   out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$abandoned_pid" 2>/dev/null)
-  expect_eq "daemon-guard: an orphaned node whose cwd IS a worktree is still safe_kill" \
+  expect_eq "daemon-guard: an orphaned MCP server (session-child signature) in a worktree is still safe_kill" \
     "safe_kill" "$(json_get "$out" 'd["classification"]')"
+fi
+
+# ── THE CLASS: ppid==1 + a live worktree cwd + NO abandonment signal -> protected ─────────
+# Round 3's P1, and the reason the daemon ENUMERATION was abandoned for a positive abandonment
+# signal. Verified live before this fix: a self-daemonized `agent-browser` (pid 82997 — LISTENING
+# on localhost:54172, ESTABLISHED to its Chrome, live child, cwd in a sibling worktree) classified
+#   {"classification":"safe_kill","owner_worktree":"/…/worktrees/relight-logo-combined"}
+# and so did its Chrome (83002). agent-browser self-daemonizes for session persistence: ppid==1 is
+# its designed steady state. It is not launchd-managed and carries no session-host name, so every
+# positive DAEMON signal missed it — and it fell to `owner != "" -> safe_kill`.
+#
+# The fixture is deliberately a name that is in NO pattern list and NO daemon list — that is the
+# whole point. Enumerating `agent-browser` would have made this green while leaving the class open
+# for round 4's daemon. The assertion is about the ABSENCE of an abandonment signal, so it holds for
+# any daemon nobody thought to name.
+
+selfd_exec=$(mk_exec "$TMPROOT/bin" "agent-browser-darwin-arm64")
+selfd_pid=$(spawn_orphan "$wt_a" "$selfd_exec" --serve --port 54172)
+
+if [[ -z "$selfd_pid" ]]; then
+  nok "abandonment-signal: could not mint the self-daemonized candidate (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$selfd_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "safe_kill" ]]; then
+    nok "abandonment-signal: THE REGRESSION — a ppid=1 self-daemonized server whose cwd IS a worktree is safe_kill (this is the live agent-browser + its Chrome)"
+  else
+    ok "abandonment-signal: a ppid=1 daemon with a live cwd and no session-child signature is NOT safe_kill (got $cls)"
+  fi
+  expect_eq "abandonment-signal: it fails closed to protected, not consent_required" \
+    "protected" "$cls"
+
+  # protected must hold at ACT time too — and --consent must not unlock it.
+  crush_in "$wt_a" kill --consent "$selfd_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "abandonment-signal: --consent cannot unlock it either" "$selfd_pid"
+
+  # Ownership is still REPORTED — the axis works, it just does not authorize a kill.
+  expect_eq "abandonment-signal: its owning worktree is still reported" \
+    "$wt_a" "$(json_get "$out" 'd["owner_worktree"]')"
 fi
 
 # ── SESSION HOSTS: ppid==1 AND cwd IS a worktree, and STILL never killable ────────────────

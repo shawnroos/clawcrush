@@ -157,7 +157,17 @@ else
     nok "ports: the orphaned port-squatter is not detected"
   else
     expect_eq "ports: the orphaned squatter is on the expected port" "4287" "$(json_get "$entry" 'd["port"]')"
-    expect_eq "ports: the orphaned squatter is safe_kill" "safe_kill" "$(json_get "$entry" 'd["classification"]')"
+    # REPORT-ONLY, deliberately. This asserted safe_kill under the old model, where "orphaned
+    # listener on 42xx" was read as abandonment. A listener is by definition SERVING, and ppid==1
+    # does not distinguish "its session died" from "it was disowned on purpose" — which is exactly
+    # how the live `ng serve` on :3007 (pid 23675) became a kill candidate.
+    #
+    # It also contradicted the handoff ADDENDUM's own field-evidenced P0: never kill another
+    # worktree's live `ng test`/`serve`. A listener on 4200 IS that server. The correct action there
+    # was to reroute specs to CI, not to kill the sibling — so port detection's job is VISIBILITY:
+    # it tells you who holds the port and which worktree owns it. Reclaiming it is a human's call.
+    expect_eq "ports: an orphaned listener is REPORTED but protected (listening = serving)" \
+      "protected" "$(json_get "$entry" 'd["classification"]')"
   fi
 fi
 
@@ -197,8 +207,13 @@ else
   else
     expect_eq "ports(spaced): a spaced-command listener (Chrome's real shape) IS detected" \
       "4289" "$(json_get "$entry" 'd["port"]')"
-    expect_eq "ports(spaced): and it is classified, not silently dropped" \
-      "safe_kill" "$(json_get "$entry" 'd["classification"]')"
+    # This assertion is about the PARSE, not the verdict — it pins that a spaced command name
+    # survives scan_ports and arrives classified rather than being dropped on the floor. It read
+    # safe_kill under the old model; a listener is now protected (see the 4287 case above), so the
+    # verdict moved while the property under test did not. `protected` is still a classification —
+    # a dropped listener would show up as a missing entry, which the branch above catches.
+    expect_eq "ports(spaced): and it is classified, not silently dropped (listener -> protected)" \
+      "protected" "$(json_get "$entry" 'd["classification"]')"
   fi
 fi
 
@@ -255,6 +270,73 @@ else
   else
     nok "grace: the default class only took ${karma_elapsed}s (expected ~5s)"
   fi
+fi
+
+# ── THE LIVENESS VETO: a dev server that is SERVING is never killed ───────────────────────
+# Round 3's second P0. `ng serve` at ppid==1 was read as "its session died", but
+# `nohup npm run start:dev1 … & disown` is the DOCUMENTED launch path in these worktrees, so a dev
+# server is ppid==1 FROM BIRTH. Verified live before this fix: pid 23675
+# `npm exec ng serve --configuration=dev --port 3007`, ppid==1, 4h15m old, classified
+#   {"classification":"safe_kill","owner_worktree":"…/worktrees/unified-canvas-selection"}
+# while its child 23709 held `127.0.0.1:3007 (LISTEN)`. do_kill refuses only `protected`, so
+# `crush.sh kill 23675` would have taken down a dev server that was actively serving.
+#
+# The name cannot authorize the kill, so the veto asks what the process is DOING. Deliberately a
+# BEHAVIOURAL signal rather than another name list — the name lists failed in rounds 2 and 3, each
+# time on the first daemon nobody had enumerated.
+#
+# THE FIXTURE MIRRORS THE REAL SHAPE: the subject holds NO socket, its CHILD does — exactly like the
+# `npm exec` wrapper over node. A veto that only inspected the subject would pass a subject-holds-it
+# fixture and still kill 23675. The fixture has to be able to catch the real bug.
+
+veto_port=$(( 20000 + (RANDOM % 20000) ))
+ng_serving=$(mk_exec "$TMPROOT/bin2" "ng" \
+  "python3 -m http.server $veto_port --bind 127.0.0.1 >/dev/null 2>&1 &
+   wait")
+serving_pid=$(spawn_orphan "$wt_a" "$ng_serving" serve --port "$veto_port")
+
+# The child needs a moment to bind before the veto can observe it.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  lsof -nP -iTCP:"$veto_port" -sTCP:LISTEN >/dev/null 2>&1 && break
+  sleep 0.4
+done
+
+if [[ -z "$serving_pid" ]]; then
+  nok "veto: could not mint the serving-dev-server candidate (harness failure)"
+elif ! lsof -nP -iTCP:"$veto_port" -sTCP:LISTEN >/dev/null 2>&1; then
+  nok "veto: fixture never bound port $veto_port — the veto assertion would be vacuous (harness failure)"
+else
+  # Prove the premise of the fixture: the SUBJECT holds nothing, the CHILD holds the socket.
+  if lsof -nP -iTCP -sTCP:LISTEN -a -p "$serving_pid" 2>/dev/null | grep -q LISTEN; then
+    nok "veto: fixture is wrong shape — the SUBJECT holds the socket, so it cannot catch the 23675 (wrapper+child) bug"
+  else
+    ok "veto: fixture mirrors 23675 — subject holds no socket, a child holds it"
+  fi
+
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$serving_pid" 2>/dev/null)
+  cls=$(json_get "$out" 'd["classification"]')
+  if [[ "$cls" == "safe_kill" ]]; then
+    nok "veto: THE REGRESSION — a ppid=1 ng serve whose child is LISTENING is safe_kill (this is live pid 23675)"
+  else
+    ok "veto: a ppid=1 ng serve whose child is LISTENING is NOT safe_kill (got $cls)"
+  fi
+  expect_eq "veto: it is protected, not merely consent_required" "protected" "$cls"
+
+  crush_in "$wt_a" kill --consent "$serving_pid" >/dev/null 2>&1
+  sleep 1
+  expect_alive "veto: --consent cannot unlock a serving dev server either" "$serving_pid"
+fi
+
+# RECALL CONTROL — the veto must not be a blanket amnesty for dev-stack processes. A finished
+# karma/ng-test corpse holds no socket, and it is the ~100+/week toil U2 exists to reclaim. If this
+# goes red the fix has bought precision by making the feature do nothing.
+corpse_pid=$(spawn_orphan "$wt_a" "$ng" test --watch=false)
+if [[ -z "$corpse_pid" ]]; then
+  nok "veto: could not mint the finished-test corpse (harness failure)"
+else
+  out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$corpse_pid" 2>/dev/null)
+  expect_eq "veto: RECALL — an orphaned ng test holding NO socket is still safe_kill" \
+    "safe_kill" "$(json_get "$out" 'd["classification"]')"
 fi
 
 finish
