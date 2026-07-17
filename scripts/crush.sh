@@ -326,24 +326,46 @@ is_safe() {
 # Was this path modified in the last N minutes?
 # For DIRECTORIES, judge by the newest CONTENT mtime. SLOP_DIRS are all directories and their
 # deletion is recursive, so the directory inode's own mtime is the wrong signal (F7).
+# ── POLARITY (same rule as holds_listening_socket). ──
+# This predicate's job is to PREVENT a deletion, so returning 0 ("recent") is the SAFE answer and
+# every uncertain path must take it. It used to do the opposite, in both branches:
+#   - `stat -f %m … || echo 0` turned a stat FAILURE into epoch 0, i.e. "modified in 1970", i.e.
+#     maximally old, i.e. DELETE IT. An unreadable mtime is the one case where you least want that.
+#   - `find … | grep -q .` cannot distinguish "find errored" from "nothing recent", so a permission
+#     error read as "not recent" -> DELETE IT.
+# Unknowns must fail closed (CLAUDE.md, hardcoded). An unknown mtime is not evidence of age.
 is_recent() {
   local filepath="$1"
   local mins="${2:-$RECENT_MINUTES}"
 
+  # A directory is judged by its NEWEST CONTENT, not its own mtime (F7: a dir's mtime does not move
+  # when a file inside it is written, and every SLOP_DIRS entry is a directory — the guard was
+  # weakest exactly where deletion is recursive).
   if [[ -d "$filepath" ]]; then
-    find "$filepath" -mmin "-${mins}" -print -quit 2>/dev/null | grep -q .
-    return $?
+    local found rc=0
+    found=$(find "$filepath" -mmin "-${mins}" -print 2>/dev/null | head -1) || rc=$?
+    [[ -n "$found" ]] && return 0          # something recent inside -> recent
+    (( rc != 0 )) && return 0              # find errored -> unknown -> assume recent
+    return 1                               # clean walk, nothing recent
   fi
 
+  local mod_epoch="" now_epoch age_mins
   if [[ "$(uname)" == "Darwin" ]]; then
-    local mod_epoch now_epoch age_mins
-    mod_epoch=$(stat -f %m "$filepath" 2>/dev/null || echo 0)
-    now_epoch=$(date +%s)
-    age_mins=$(( (now_epoch - mod_epoch) / 60 ))
-    (( age_mins < mins ))
+    mod_epoch=$(stat -f %m "$filepath" 2>/dev/null) || mod_epoch=""
   else
-    find "$filepath" -maxdepth 0 -mmin "-${mins}" 2>/dev/null | grep -q .
+    mod_epoch=$(stat -c %Y "$filepath" 2>/dev/null) || mod_epoch=""
   fi
+
+  # Unreadable/absent mtime -> the question was not answered -> assume recent, refuse the delete.
+  [[ "$mod_epoch" =~ ^[0-9]+$ ]] || return 0
+
+  now_epoch=$(date +%s)
+  age_mins=$(( (now_epoch - mod_epoch) / 60 ))
+
+  # A future mtime (clock skew, a touched-forward file) is not evidence of age either.
+  (( age_mins < 0 )) && return 0
+
+  (( age_mins < mins ))
 }
 
 # Check if a file matches any crushignore pattern
@@ -1329,11 +1351,41 @@ scan_slop() {
 # Resolve a ~/.claude/projects/<dir>'s REAL cwd from its newest session JSONL.
 # The dash-encoding is NOT invertible (F5: 138/145 live dirs decoded to nonexistent paths and
 # were offered for deletion). Never guess — no parseable cwd means fail closed.
+#
+# Parsed with a real JSON parser, NOT `grep -o '"cwd":"[^"]*"'`. That expression terminates at the
+# first quote, so a cwd containing an ESCAPED quote is silently truncated to a prefix:
+#   {"cwd":"/Users/shawnroos/projects/we\"ird/live"}  ->  /Users/shawnroos/projects/we\
+# The truncated path does not exist, so a LIVE project reports as an orphaned ref and is offered for
+# deletion. Worse, scan and the delete-side revalidation ran the SAME parse, so they agreed with each
+# other and the containment check passed — two independent-looking guards sharing one bug.
+#
+# No python3, or a line that will not parse, means the question is unanswered: fail closed (return 1)
+# so the dir is never treated as orphaned. Deleting a live session's transcript is unrecoverable.
 resolve_project_cwd() {
   local ref_dir="$1" newest cwd
   newest=$(ls -t "${ref_dir%/}"/*.jsonl 2>/dev/null | head -1) || true
   [[ -n "$newest" && -f "$newest" ]] || return 1
-  cwd=$(grep -o '"cwd":"[^"]*"' "$newest" 2>/dev/null | head -1 | sed 's/^"cwd":"//; s/"$//') || true
+  command -v python3 >/dev/null 2>&1 || return 1
+  cwd=$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                c = obj.get("cwd")
+                if isinstance(c, str) and c:
+                    sys.stdout.write(c)
+                    break
+except Exception:
+    sys.exit(1)
+' "$newest" 2>/dev/null) || return 1
   [[ -n "$cwd" ]] || return 1
   printf '%s' "$cwd"
 }
