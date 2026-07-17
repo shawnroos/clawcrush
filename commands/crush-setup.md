@@ -35,9 +35,12 @@ Present the results in formatted sections. Use this layout:
 |---|-----|------|-----|-------|----------------|--------|
 (list each zombie from the scan)
 
-Only `safe_kill` entries are genuine orphans. `consent_required` means the process is attached to a
-live parent, and `protected` means it belongs to another worktree's live session (or is on the
-never-kill allowlist) — those are shown so the user understands what clawcrush will *not* touch.
+Only `safe_kill` entries are ones the engine has positive proof are abandoned (`ppid=1` **and** a
+deleted cwd, an MCP-server signature, or a dev-stack/headless-browser process holding no listening
+socket — `ppid=1` on its own is a lifecycle fact, not abandonment). `consent_required` means the
+process is attached to a live parent, and `protected` means it belongs to another worktree's live
+session, is a daemon, is serving on a socket, or is on the never-kill allowlist — those are shown so
+the user understands what clawcrush will *not* touch.
 
 If no zombies: "No zombie processes found."
 

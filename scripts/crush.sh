@@ -609,12 +609,72 @@ pid_tree_of() {
 #
 # Only consulted for orphaned dev-stack candidates, so the lsof cost is bounded to a handful of pids
 # on a box whose defining condition is that it is already contended.
+#
+# ── POLARITY. Read this before touching anything below. ──
+# This predicate's job is to PREVENT a kill, so its uncertain paths must resolve to "assume it is
+# serving" (return 0). Every `return 1` is a claim of PROOF that nothing is listening. Getting this
+# backwards does not make the veto weaker — it silently deletes it.
+#
+# It was backwards on arrival, and it undid the entire commit it shipped in:
+#
+#   lsof -nP … -p "$plist" | grep -q LISTEN
+#
+# `lsof` exits 1 if ANY pid in -p is not found — EVEN WHEN it successfully printed the LISTEN lines.
+# Under this file's `set -o pipefail` (line 42), the pipeline takes lsof's status, not grep's, so the
+# LISTEN line is found and then thrown away. Reproduced against a real listener (pid 747):
+#   lsof PRINTED a LISTEN line? YES     lsof EXIT status: 1
+#   veto as written (pipefail on)  -> FAILS OPEN -> safe_kill
+#   identical call, pipefail off   -> fires      -> protected
+# Two triggers, one root cause: (a) an unreaped zombie child, and (b) a pid_tree_of snapshot race —
+# `ps` snapshots the tree, `lsof` runs later, and any descendant exiting in that window is enough. A
+# dev-server tree spawns short-lived children constantly, so (b) is an intermittent SIGTERM of a live
+# server that no deterministic test would ever reproduce.
+#
+# So: trust what lsof PRINTED, never its exit status, and fail closed on every ambiguity.
 holds_listening_socket() {
-  local tree plist
+  local tree plist out rc=0
   tree=$(pid_tree_of "$1")
   plist=$(printf '%s' "$tree" | sed 's/^ *//; s/ *$//; s/  */,/g')
-  [[ -z "$plist" ]] && return 1
-  lsof -nP -iTCP -sTCP:LISTEN -a -p "$plist" 2>/dev/null | grep -q LISTEN
+
+  # Unknown tree — cannot prove abandonment, so assume it is serving.
+  [[ -z "$plist" ]] && return 0
+
+  # No lsof — cannot prove abandonment. Not a live defect under the shipped LaunchAgent (launchd's
+  # default PATH is /usr/bin:/bin:/usr/sbin:/sbin and lsof is /usr/sbin/lsof), but the blast radius
+  # if it ever went missing is total: set_pid_cwd would fail too, every dev-pattern orphan would
+  # reach this veto with no owner, and a fail-open veto turns that into a mass safe_kill.
+  command -v lsof >/dev/null 2>&1 || return 0
+
+  # DO NOT reintroduce `-p "$plist"`. `lsof` exits 1 for BOTH "a pid in -p was not found" AND "no
+  # matching open files", and those two are indistinguishable from the exit status alone. That
+  # ambiguity has no safe resolution: treating rc!=0 as "not listening" fails OPEN and kills a live
+  # server (the pipefail bug); treating it as "serving" fails CLOSED on every socket-less process
+  # and silently drops recall to zero — a veto that protects everything is a feature that does
+  # nothing. The recall control in u2 catches the second, which is how this was found.
+  #
+  # So never ask lsof about specific pids. Ask it for ALL listeners — a query that does not depend
+  # on any pid still existing — and look our tree up in the answer. A descendant exiting mid-flight
+  # cannot make this call error, which also closes the pid_tree_of snapshot race at the source.
+  out=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null) || rc=$?
+
+  # No output at all means lsof failed or is lying (a box with zero listeners is implausible here).
+  # Unanswered question -> assume serving.
+  if [[ -z "$out" ]]; then
+    return 0
+  fi
+
+  # lsof's own COMMAND column can contain spaces ("Google Chrome"), so this reads the PID by field
+  # position off a known-good header, not by parsing the command.
+  local listeners lp
+  listeners=$(printf '%s\n' "$out" | awk 'NR > 1 { print $2 }' | sort -u)
+  for lp in $listeners; do
+    case "$plist" in
+      "$lp"|"$lp,"*|*",$lp"|*",$lp,"*) return 0 ;;
+    esac
+  done
+
+  # lsof answered, and nothing in our tree is in it. The only path that has proven a negative.
+  return 1
 }
 
 # LAUNCHD MEMBERSHIP — the positive signal the old daemon guard was trying to INFER from the cwd.

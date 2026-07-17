@@ -11,8 +11,15 @@ Scan for zombies and slop, then crush what is safe to crush without asking. Narr
 
 Fullcream means "no confirmation" — so it may only ever act on things that need no confirmation.
 
-**Only crush processes whose `classification` is `safe_kill`.** Those are genuine orphans: `ppid=1`,
-no live parent, nothing attached to them.
+**Only crush processes whose `classification` is `safe_kill`.** Those are the ones the engine has
+positive proof are abandoned — `ppid=1` **and** a deleted cwd, an MCP-server signature, or a
+dev-stack/headless-browser process holding no listening socket.
+
+`ppid=1` alone is **not** abandonment and must never be treated as such here: it is a lifecycle fact
+(launchd services, tmux, and self-daemonizing servers are `ppid=1` for life; a dev server launched
+with `nohup … & disown` is `ppid=1` from birth). Read `classification` and obey it — never re-derive
+the verdict from `orphan`, `owner_worktree`, or age. Those fields are display metadata. The engine is
+the only thing that decides, and fullcream acts without a human, so a wrong call here is unrecoverable.
 
 **NEVER pass `--consent` to `crush.sh kill`. Not for any item, not for any reason.** `--consent` is a
 per-item human decision, and there is no human here. A `consent_required` process is one that is

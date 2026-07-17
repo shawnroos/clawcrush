@@ -301,10 +301,17 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   sleep 0.4
 done
 
+veto_listener=$(lsof -nP -iTCP:"$veto_port" -sTCP:LISTEN -t 2>/dev/null | head -1)
+veto_kids=$(pgrep -P "${serving_pid:-0}" 2>/dev/null | tr '\n' ' ')
+
 if [[ -z "$serving_pid" ]]; then
   nok "veto: could not mint the serving-dev-server candidate (harness failure)"
-elif ! lsof -nP -iTCP:"$veto_port" -sTCP:LISTEN >/dev/null 2>&1; then
+elif [[ -z "$veto_listener" ]]; then
   nok "veto: fixture never bound port $veto_port — the veto assertion would be vacuous (harness failure)"
+elif [[ " $veto_kids " != *" $veto_listener "* ]]; then
+  # A global port check would pass if an unrelated process already held this random port, and every
+  # assertion below would then be measuring someone else's socket.
+  nok "veto: port $veto_port is held by pid $veto_listener, not our child (${veto_kids:-none}) — fixture is measuring someone else"
 else
   # Prove the premise of the fixture: the SUBJECT holds nothing, the CHILD holds the socket.
   if lsof -nP -iTCP -sTCP:LISTEN -a -p "$serving_pid" 2>/dev/null | grep -q LISTEN; then
@@ -325,6 +332,82 @@ else
   crush_in "$wt_a" kill --consent "$serving_pid" >/dev/null 2>&1
   sleep 1
   expect_alive "veto: --consent cannot unlock a serving dev server either" "$serving_pid"
+fi
+
+# ── THE VETO MUST NOT FAIL OPEN ON lsof's EXIT STATUS ─────────────────────────────────────
+# `lsof` exits 1 if ANY pid in -p is not found, EVEN WHEN it printed the LISTEN lines. Under
+# `set -o pipefail` the original `lsof … | grep -q LISTEN` took lsof's status instead of grep's, so
+# a serving process classified safe_kill. One unreaped zombie child was the whole difference between
+# protected and safe_kill.
+#
+# The fixture therefore needs a tree that is BOTH listening AND has a dead child — the shape the
+# other veto test structurally cannot produce, because a clean tree makes lsof exit 0 and the bug
+# invisible. The same root cause also fires on a pid_tree_of snapshot race (a descendant exiting
+# between `ps` and `lsof`), which is nondeterministic; the zombie is its deterministic twin.
+
+zport=$(( 20000 + (RANDOM % 20000) ))
+
+# Written directly rather than via mk_exec: bash REAPS its background children (a `( exit 0 ) &` left
+# no zombie and the test went green against the broken engine — the harness-failure guard below is
+# the only reason that was visible). Python never reaps without an explicit wait(), so forking there
+# and returning gives a durable zombie. argv[0] is the file path, so naming the file `vite` is what
+# boundary-matches DEV_PATTERNS — the same shape the real matcher sees.
+mkdir -p "$TMPROOT/bin3"
+zombie_exec="$TMPROOT/bin3/vite"
+cat > "$zombie_exec" <<PYEOF
+#!/usr/bin/env python3
+import os, socket, sys, time
+# Child 1: hold a real LISTENING socket.
+if os.fork() == 0:
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", $zport)); s.listen(5)
+    while True: time.sleep(1)
+# Child 2: exit immediately. Never wait()ed -> stays <defunct> in our tree, which is what makes
+# lsof exit non-zero while still printing child 1's LISTEN line.
+if os.fork() == 0:
+    os._exit(0)
+time.sleep(3600)
+PYEOF
+chmod +x "$zombie_exec"
+zombie_pid=$(spawn_orphan "$wt_a" "$zombie_exec" build --watch)
+sleep 1
+
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  lsof -nP -iTCP:"$zport" -sTCP:LISTEN >/dev/null 2>&1 && break
+  sleep 0.4
+done
+
+if [[ -z "$zombie_pid" ]]; then
+  nok "veto/zombie: could not mint the candidate (harness failure)"
+else
+  # The fixture is only meaningful if the listener really is OUR descendant — a global port check
+  # would pass if some unrelated process already held this random port, and the assertion below
+  # would then be vacuous.
+  listener_pid=$(lsof -nP -iTCP:"$zport" -sTCP:LISTEN -t 2>/dev/null | head -1)
+  tree_pids=$(pgrep -P "$zombie_pid" 2>/dev/null | tr '\n' ' ')
+  if [[ -z "$listener_pid" ]]; then
+    nok "veto/zombie: nothing bound port $zport — the assertion would be vacuous (harness failure)"
+  elif [[ " $tree_pids " != *" $listener_pid "* ]]; then
+    nok "veto/zombie: port $zport is held by pid $listener_pid which is NOT our child (${tree_pids:-none}) — fixture is measuring someone else"
+  else
+    ok "veto/zombie: fixture verified — the listener ($listener_pid) is our own child"
+    # `pgrep -P` does not report zombies, so ask ps for the whole table and filter by ppid — the
+    # zombie is precisely the thing pgrep cannot see, and it is the thing under test.
+    if ps -o ppid=,stat= -ax 2>/dev/null | awk -v p="$zombie_pid" '$1==p && $2 ~ /Z/' | grep -q .; then
+      ok "veto/zombie: fixture verified — the tree really does contain an unreaped zombie"
+    else
+      nok "veto/zombie: no zombie in the tree — this fixture cannot catch the pipefail bug (harness failure)"
+    fi
+
+    out=$(CRUSH_MIN_AGE_MINUTES=0 crush_in "$wt_a" classify "$zombie_pid" 2>/dev/null)
+    cls=$(json_get "$out" 'd["classification"]')
+    if [[ "$cls" == "safe_kill" ]]; then
+      nok "veto/zombie: THE REGRESSION — a LISTENING tree with a zombie child is safe_kill (lsof exit status read as 'no listener')"
+    else
+      ok "veto/zombie: a LISTENING tree with a zombie child is still protected (got $cls)"
+    fi
+    expect_eq "veto/zombie: lsof's exit status must not override what it printed" "protected" "$cls"
+  fi
 fi
 
 # RECALL CONTROL — the veto must not be a blanket amnesty for dev-stack processes. A finished

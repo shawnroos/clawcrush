@@ -32,9 +32,15 @@ Every zombie and port entry carries a `classification`:
 
 | classification | meaning | what lowfat may do |
 |---|---|---|
-| `safe_kill` | genuine orphan (`ppid=1`), no live parent | offer it; kill with a plain `kill <pid>` |
+| `safe_kill` | `ppid=1` **and** positive proof of abandonment: a deleted cwd, an MCP-server signature, or a dev-stack/headless-browser process holding no listening socket | offer it; kill with a plain `kill <pid>` |
 | `consent_required` | attached to a live parent, owned by this worktree (or owner unresolvable) | offer it **individually**; kill only with `--consent <pid>` |
-| `protected` | another worktree's live session, crush's own tree, or the never-kill allowlist | **never offer it.** Display only. |
+| `protected` | another worktree's live session, a daemon, anything serving on a socket, crush's own tree, or the never-kill allowlist | **never offer it.** Display only. |
+
+`ppid=1` on its own is **never** `safe_kill`. It is a lifecycle fact — launchd services, tmux, and
+self-daemonizing servers are `ppid=1` for their entire life, and a dev server launched with
+`nohup … & disown` is `ppid=1` from birth. Ownership is not abandonment evidence either. Unknowns
+(an `lsof` failure, an unresolvable cwd) are never killable. **Do not re-derive any of this in the
+command layer — read `classification` and obey it.** The engine is the only place that decides.
 
 Slop items carry `tracked` (report-only when true) and, when untracked, their own `root`.
 
